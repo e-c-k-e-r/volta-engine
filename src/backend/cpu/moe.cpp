@@ -142,11 +142,11 @@ void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::h
 	}
 }
 
+// linear_trellis.cpp: the trellis linear of a whole weight, an extended trellis' tile starts and gains included
+void trellis_weight_forward( const pod::TensorView& x, const pod::LinearWeight& w, pod::TensorView& out, backend::stream_t stream );
+
 // Pointer tables are a CUDA-side convenience (device array of per-expert pointers); the CPU path reads LinearWeight directly
 void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena&, backend::stream_t ) {
-	for ( int e = 0; e < weights.num_local_experts; ++e ) {
-		ENGINE_ASSERT( !weights.gate[e].extended() && !weights.up[e].extended() && !weights.down[e].extended(), "MoE (CPU): the extended trellis (tile starts / gains) runs on CUDA only" );
-	}
 	weights.device_ptrs = nullptr;
 }
 
@@ -186,10 +186,15 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 		pod::TensorView tu = pod::make_tensor_2d( u.data(), pod::DType::FP16, cnt, inter );
 		pod::TensorView ta = pod::make_tensor_2d( a.data(), pod::DType::FP16, cnt, inter );
 		pod::TensorView td = pod::make_tensor_2d( d.data(), pod::DType::FP16, cnt, hidden );
-		Linear::forward( tx, weights.gate[le], tg, stream );
-		Linear::forward( tx, weights.up[le], tu, stream );
+		// an extended trellis (tile starts / gains) through the trellis linear of linear_trellis.cpp
+		auto lin = [&]( const pod::TensorView& in, const pod::LinearWeight& w, pod::TensorView& o ) {
+			if ( w.extended() ) trellis_weight_forward( in, w, o, stream );
+			else Linear::forward( in, w, o, stream );
+		};
+		lin( tx, weights.gate[le], tg );
+		lin( tx, weights.up[le], tu );
 		SwiGLU::forward( tg, tu, ta, stream, act_limit );
-		Linear::forward( ta, weights.down[le], td, stream );
+		lin( ta, weights.down[le], td );
 		for ( int h = 0; h < cnt; ++h ) std::memcpy( route_out.data() + static_cast<size_t>( hits[h] ) * hidden, d.data() + static_cast<size_t>( h ) * hidden, hidden * sizeof( backend::half_t ) );
 	}
 	std::vector<float> acc( static_cast<size_t>( hidden ) );

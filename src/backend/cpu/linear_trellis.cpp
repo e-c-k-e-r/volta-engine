@@ -3,6 +3,7 @@
 // kernels and the large-M recon path differ from this only by FP16/FP32 rounding order.
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
+#include "engine/modules/linear.h"
 #include "engine/modules/trellis.h"
 #include "engine/modules/trellis_bits.h"
 #if defined(__AVX2__)
@@ -43,12 +44,14 @@ int codebook( bool mcg, bool mul1 ) {
 	return mcg ? 1 : ( mul1 ? 2 : 0 );
 }
 
-// The first stream bit of position p's 16-bit window in a tile of `total` bits, width code `code` (trellis_bits.h: a half-integer rate's
-// windows end K and K + 1 bits apart, alternately)
-inline int window_start( int p, int code, int total ) {
-	const int end = trellis_is_half( code ) ? ( p >> 1 ) * ( 2 * trellis_base_bits( code ) + 1 ) + ( ( p & 1 ) ? 2 * trellis_base_bits( code ) + 1 : trellis_base_bits( code ) )
+// The stream bit where position p's 16-bit window ends, width code `code` (trellis_bits.h: a half-integer rate's windows end K and K + 1 bits
+// apart, alternately), and the first bit of that window in a tile of `total` bits
+inline int window_end( int p, int code ) {
+	return trellis_is_half( code ) ? ( p >> 1 ) * ( 2 * trellis_base_bits( code ) + 1 ) + ( ( p & 1 ) ? 2 * trellis_base_bits( code ) + 1 : trellis_base_bits( code ) )
 		: ( p + 1 ) * code;
-	return ( end - 16 + total ) % total;
+}
+inline int window_start( int p, int code, int total ) {
+	return ( window_end( p, code ) - 16 + total ) % total;
 }
 
 float half_to_float( half h ) {
@@ -134,8 +137,10 @@ void decode_tile_avx2( const uint8_t* stream, int total, int bits, int cb, uint1
 
 // Native reconstruction of the dequantized [k, n] weight (same result as the ref_trellis_reconstruct kernel, which costs ~100 ns per
 // element on the host): each 16x16 tile's cyclic MSB-first bit stream is laid out as bytes once, then a window is one unaligned read.
-// volta: the tiles are in the Volta order (LinearWeight::volta_tiles), which only changes where stream position p lands in the tile
-void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bits, int cb, bool volta ) {
+// volta: the tiles are in the Volta order (LinearWeight::volta_tiles), which only changes where stream position p lands in the tile.
+// The extended trellis: starts (a tile's start state, uint16) supplies the bits before the stream to the windows that begin there instead of
+// the stream's end, gains (a tile's code c) multiplies its values by (896 + c) / 1024 in FP16, as exl3_dq_ext.cuh does
+void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bits, int cb, bool volta, const uint16_t* starts = nullptr, const uint8_t* gains = nullptr ) {
 	static_assert( sizeof( half ) == 2, "reconstruct_native: half must be 16 bits" );
 	const int tiles_n = n / 16;
 	const int tile_u16 = trellis_tile_u16( bits );
@@ -164,6 +169,16 @@ void reconstruct_native( const uint16_t* codes, half* out, int k, int n, int bit
 					vals[p] = decode_window( ( v >> ( 16 - ( q0 & 7 ) ) ) & 0xffffu, cb );
 				}
 #endif
+				const size_t ti = static_cast<size_t>( kt ) * tiles_n + nt;
+				if ( starts != nullptr ) {
+					// the start state above the stream's first 16 bits: window( end ) = bits [end - 16, end), the ones before bit 0 from the start state's low bits
+					const uint32_t xs = ( static_cast<uint32_t>( starts[ti] ) << 16 ) | ( static_cast<uint32_t>( stream[0] ) << 8 ) | stream[1];
+					for ( int p = 0; p < 256 && window_end( p, bits ) < 16; ++p ) vals[p] = decode_window( ( xs >> ( 16 - window_end( p, bits ) ) ) & 0xffffu, cb );
+				}
+				if ( gains != nullptr ) {
+					const float g = ( 896.0f + static_cast<float>( gains[ti] ) ) * ( 1.0f / 1024.0f );   // exact in FP16; the product rounds once, as an FP16 multiply
+					for ( int p = 0; p < 256; ++p ) vals[p] = float_to_hbits( hbits_to_float( vals[p] ) * g );
+				}
 				for ( int p = 0; p < 256; ++p ) {
 					const int L = p >> 3, i = p & 7;
 					int row, col;
@@ -221,7 +236,8 @@ void linear_fp32_out( const std::vector<half>& xh, const half* w, const half* sv
 	}
 }
 
-void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta ) {
+void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta,
+	const uint16_t* starts, const uint8_t* gains ) {
 	const int m = x.shape[0];
 	const int k = trellis.shape[0] * 16;
 	const int n = trellis.shape[1] * 16;
@@ -235,7 +251,7 @@ void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trell
 	if ( wbuf.size() < static_cast<size_t>( k ) * n ) wbuf.resize( static_cast<size_t>( k ) * n );
 	const half* w = wbuf.data();
 	had_rows( x.ptr<const half>(), xh.data(), suh.ptr<const half>(), nullptr, m, k );
-	reconstruct_native( trellis.ptr<const uint16_t>(), wbuf.data(), k, n, bits, cb, volta );
+	reconstruct_native( trellis.ptr<const uint16_t>(), wbuf.data(), k, n, bits, cb, volta, starts, gains );
 	if ( out.dtype == pod::DType::FP32 ) {
 		linear_fp32_out( xh, w, svh.ptr<const half>(), out.ptr<float>(), m, k, n );
 		return;
@@ -248,15 +264,16 @@ void trellis_linear_impl( const pod::TensorView& x, const pod::TensorView& trell
 }
 
 // ENGINE_DEBUG_CPU_TRACE=1: one line per call with the elapsed time and the weight elements dequantized so far
-void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta ) {
+void trellis_linear( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, bool volta,
+	const uint16_t* starts = nullptr, const uint8_t* gains = nullptr ) {
 	static const bool trace = std::getenv( "ENGINE_DEBUG_CPU_TRACE" ) != nullptr;
 	if ( !trace ) {
-		trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1, volta );
+		trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1, volta, starts, gains );
 		return;
 	}
 	static double total_elems = 0.0;
 	const auto t0 = std::chrono::steady_clock::now();
-	trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1, volta );
+	trellis_linear_impl( x, trellis, suh, svh, out, bits, mcg, mul1, volta, starts, gains );
 	total_elems += static_cast<double>( trellis.shape[0] ) * 16 * trellis.shape[1] * 16;
 	std::fprintf( stderr, "[cpu-trace] linear %dx%d m=%d %.0f ms, %.2f G elems so far\n", trellis.shape[0] * 16, trellis.shape[1] * 16, x.shape[0],
 		std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count(), total_elems * 1e-9 );
@@ -270,6 +287,12 @@ void LinearTrellis::forward( const pod::TensorView& x, const pod::TensorView& tr
 
 void LinearTrellis::forward_recon( const pod::TensorView& x, const pod::TensorView& trellis, const pod::TensorView& suh, const pod::TensorView& svh, pod::TensorView& out, int bits, bool mcg, bool mul1, backend::stream_t, bool volta_tiles ) {
 	trellis_linear( x, trellis, suh, svh, out, bits, mcg, mul1, volta_tiles );
+}
+
+// The trellis linear of a whole weight, an extended trellis' tile starts and gains included (the MoE's experts; Linear::forward refuses it)
+void trellis_weight_forward( const pod::TensorView& x, const pod::LinearWeight& w, pod::TensorView& out, backend::stream_t ) {
+	ENGINE_ASSERT( w.type == pod::QuantType::TRELLIS, "trellis_weight_forward (CPU): a trellis weight" );
+	trellis_linear( x, w.w0, w.w1, w.w2, out, w.bits, w.mcg, !w.mcg, w.volta_tiles, w.w3.ptr<const uint16_t>(), w.w4.ptr<const uint8_t>() );
 }
 
 // one projection at a time here

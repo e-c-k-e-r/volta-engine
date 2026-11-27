@@ -75,7 +75,7 @@ ENGINE_TIER_ENTRY( MoERouter, accumulate, PortablePending, "CPU reference in src
 ENGINE_TIER_ENTRY( MoERouter, exl3_moe_dispatch, CudaSm70, "CPU reference in src/backend/cpu/moe.cpp (plain C++)" )
 ENGINE_TIER_ENTRY( MoE, init_device_ptrs, CudaSm70, "CPU and Vulkan: no-op (pointer tables unused)" )
 ENGINE_TIER_ENTRY( MoE, alloc_scratch, CudaSm70, "CPU and Vulkan: empty scratch" )
-ENGINE_TIER_ENTRY( MoE, forward, CudaSm70, "CPU: moe.cpp, Vulkan: mod_flash.cpp, both via Linear + SwiGLU module calls (Vulkan reads the routes back: not capturable); Vulkan NVFP4 experts on nvfp4.slang (nvfp4_moe_gate_up / down a workgroup per tile and route, a prefill chunk's local routes in expert order)" )
+ENGINE_TIER_ENTRY( MoE, forward, CudaSm70, "CPU: moe.cpp, Vulkan: mod_flash.cpp, both via Linear + SwiGLU module calls (Vulkan reads the routes back: not capturable), an extended trellis (tile starts / gains) through the trellis linear's extended decode; Vulkan NVFP4 experts on nvfp4.slang (nvfp4_moe_gate_up / down a workgroup per tile and route, a prefill chunk's local routes in expert order)" )
 ENGINE_TIER_ENTRY( RMSNorm, forward, Portable, "" )
 ENGINE_TIER_ENTRY( RMSNorm, forward_heads, Portable, "" )
 ENGINE_TIER_ENTRY( Elementwise, add_residual, Portable, "" )

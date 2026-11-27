@@ -196,6 +196,9 @@ void Attention::forward_sparse( const pod::KVRef& kv, const pod::TensorView& q, 
 
 // ---------------------------------------------------------------- router and MoE
 
+// mod_trellis.cpp: the trellis linear of a whole weight, an extended trellis' tile starts and gains included
+void trellis_weight_forward( const pod::TensorView& x, const pod::LinearWeight& w, pod::TensorView& out, backend::stream_t stream );
+
 void MoERouter::route_softmax_topk( const pod::TensorView& x, const pod::TensorView& router_weights, int* d_topk_indices, backend::half_t* d_topk_weights, int hidden_size, int num_experts,
 	int top_k, backend::stream_t stream, int rows ) {
 	ENGINE_ASSERT( rows >= 1 && rows <= pod::MAX_ROWS && top_k <= 16 && top_k <= num_experts && num_experts <= 512 && hidden_size % 128 == 0,
@@ -213,9 +216,6 @@ void MoERouter::route_softmax_topk( const pod::TensorView& x, const pod::TensorV
 // The host paths read the LinearWeight array directly; NVFP4 experts also get the CUDA layout's device table for nvfp4_moe_*: six pointer
 // arrays (gate codes / scales, up codes / scales, down codes / scales), then the three global-scale arrays
 void MoE::init_device_ptrs( pod::MoELayerWeights& weights, pod::MemoryArena& arena, backend::stream_t stream ) {
-	for ( int e = 0; e < weights.num_local_experts; ++e ) {
-		ENGINE_ASSERT( !weights.gate[e].extended() && !weights.up[e].extended() && !weights.down[e].extended(), "MoE (Vulkan): the extended trellis (tile starts / gains) runs on CUDA only" );
-	}
 	weights.device_ptrs = nullptr;
 	if ( weights.type != pod::QuantType::NVFP4 ) return;
 	const int E = weights.num_local_experts;
@@ -349,10 +349,15 @@ void MoE::forward( const pod::TensorView& x, const pod::MoELayerWeights& weights
 		pod::TensorView tu = pod::make_tensor_2d( u, pod::DType::FP16, cnt, inter );
 		pod::TensorView ta = pod::make_tensor_2d( a, pod::DType::FP16, cnt, inter );
 		pod::TensorView td = pod::make_tensor_2d( d, pod::DType::FP16, cnt, hidden );
-		Linear::forward( tx, weights.gate[le], tg, stream );
-		Linear::forward( tx, weights.up[le], tu, stream );
+		// an extended trellis (tile starts / gains) through the trellis linear's _ext forms
+		auto lin = [&]( const pod::TensorView& in, const pod::LinearWeight& w, pod::TensorView& o ) {
+			if ( w.extended() ) trellis_weight_forward( in, w, o, stream );
+			else Linear::forward( in, w, o, stream );
+		};
+		lin( tx, weights.gate[le], tg );
+		lin( tx, weights.up[le], tu );
 		SwiGLU::forward( tg, tu, ta, stream, act_limit );
-		Linear::forward( ta, weights.down[le], td, stream );
+		lin( ta, weights.down[le], td );
 		for ( int h = 0; h < cnt; ++h ) backend::memcpy_async( route_out + static_cast<size_t>( hits[le][h] ) * hidden, d + static_cast<size_t>( h ) * hidden, hb, backend::Copy::D2D, stream );
 	}
 	vki::MoeCombineParams p{ vki::dp( route_out ), vki::dp( d_topk_weights ), vki::dp( d_topk_indices ), vki::dp( out.data ), hidden, topk, start_expert, end_expert };

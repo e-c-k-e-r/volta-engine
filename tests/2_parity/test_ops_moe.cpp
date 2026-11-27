@@ -3,7 +3,8 @@
 // ONE source for both configurations:
 //   --dump <dir>   run in the CUDA build: computes with the real kernels, writes golden outputs
 //   --check <dir>  recompute with the built backend and compare (tier 2) against the golden files
-// 3-bit MUL1 trellis experts (what the persistent / fused CUDA kernels instantiate) and GGUF experts (Q4_K gate, IQ3_S up, Q6_K down), rows 1, 4, 17.
+// 3-bit MUL1 trellis experts (what the persistent / fused CUDA kernels instantiate), the same with the extended trellis' tile starts and gains (both,
+// starts only or gains only by expert, in the stock and the Volta tile order) and GGUF experts (Q4_K gate, IQ3_S up, Q6_K down), rows 1, 4, 17.
 // --softmax routes with MoERouter::route_softmax_topk (the Qwen family's router) instead of route_topk (GLM's sigmoid router); the case names then carry
 // an _sm suffix, so one golden directory serves both.
 #include "golden_io.h"
@@ -82,6 +83,27 @@ static pod::LinearWeight make_expert_weight( GoldenRng& rng, int k, int n, int b
 	return pod::LinearWeight::make_trellis( codes, suh, svh, bits, true, false );
 }
 
+// An extended trellis expert: random tile start states ([k / 16, n / 16] uint16) and gain codes (uint8) where asked
+static pod::LinearWeight make_ext_expert_weight( GoldenRng& rng, int k, int n, int bits, bool starts, bool gains, bool volta ) {
+	pod::LinearWeight lw = make_expert_weight( rng, k, n, bits );
+	lw.volta_tiles = volta;
+	int s[2] = { k / 16, n / 16 };
+	const size_t tiles = static_cast<size_t>( k / 16 ) * ( n / 16 );
+	if ( starts ) {
+		std::vector<uint16_t> st( tiles );
+		for ( auto& v : st ) v = static_cast<uint16_t>( rng.next() );
+		lw.w3 = core::arena_alloc_tensor( g_arena, pod::DType::UINT16, s, 2 );
+		backend::memcpy_sync( lw.w3.data, st.data(), st.size() * sizeof( uint16_t ), backend::Copy::H2D );
+	}
+	if ( gains ) {
+		std::vector<uint8_t> gn( tiles );
+		for ( auto& v : gn ) v = static_cast<uint8_t>( rng.next() );
+		lw.w4 = core::arena_alloc_tensor( g_arena, pod::DType::UINT8, s, 2 );
+		backend::memcpy_sync( lw.w4.data, gn.data(), gn.size(), backend::Copy::H2D );
+	}
+	return lw;
+}
+
 // A GGUF expert: n rows of k / 256 blocks of random bytes (valid codes for these types) with the half scales set small, so the products stay
 // in FP16 range; d_at / dmin_at are the byte offsets of the scales in a block (dmin_at < 0: none)
 static pod::LinearWeight make_gguf_expert( GoldenRng& rng, int k, int n, modules::GgmlType type, int block_bytes, int d_at, int dmin_at ) {
@@ -112,7 +134,7 @@ static pod::LinearWeight make_nvfp4_expert( GoldenRng& rng, int k, int n, float 
 	return pod::LinearWeight::make_nvfp4( codes, scales, alpha );
 }
 
-static pod::MoELayerWeights g_full, g_shard, g_gguf_full, g_gguf_shard, g_nv_full, g_nv_shard;
+static pod::MoELayerWeights g_full, g_shard, g_gguf_full, g_gguf_shard, g_nv_full, g_nv_shard, g_ext_full[2], g_ext_shard[2];
 
 struct Case {
 	std::string name;
@@ -188,6 +210,26 @@ int main( int argc, char** argv ) {
 	modules::MoE::init_device_ptrs( g_nv_shard, g_arena );
 	const pod::MoEScratch sc_nv_full = modules::MoE::alloc_scratch( g_arena, E, TOPK, H, I, max_rows, true );
 	const pod::MoEScratch sc_nv_shard = modules::MoE::alloc_scratch( g_arena, 8, TOPK, H, I, max_rows, true );
+	// Extended trellis experts: expert e has both companions (e % 3 == 0), starts only (1) or gains only (2); [0] stock, [1] Volta tile order
+	for ( int vt = 0; vt < 2; ++vt ) {
+		g_ext_full[vt].type = g_ext_shard[vt].type = pod::QuantType::TRELLIS;
+		g_ext_full[vt].num_local_experts = E;
+		g_ext_shard[vt].num_local_experts = 8;
+		g_ext_full[vt].top_k = g_ext_shard[vt].top_k = TOPK;
+		for ( int e = 0; e < E; ++e ) {
+			const bool st = e % 3 != 2, gn = e % 3 != 1;
+			g_ext_full[vt].gate[e] = make_ext_expert_weight( rng, H, I, 3, st, gn, vt == 1 );
+			g_ext_full[vt].up[e] = make_ext_expert_weight( rng, H, I, 3, st, gn, vt == 1 );
+			g_ext_full[vt].down[e] = make_ext_expert_weight( rng, I, H, 3, st, gn, vt == 1 );
+		}
+		for ( int e = 0; e < 8; ++e ) {
+			g_ext_shard[vt].gate[e] = g_ext_full[vt].gate[4 + e];
+			g_ext_shard[vt].up[e] = g_ext_full[vt].up[4 + e];
+			g_ext_shard[vt].down[e] = g_ext_full[vt].down[4 + e];
+		}
+		modules::MoE::init_device_ptrs( g_ext_full[vt], g_arena );
+		modules::MoE::init_device_ptrs( g_ext_shard[vt], g_arena );
+	}
 
 	auto router_w = upload_half( uniform_vec( rng, static_cast<size_t>( H ) * E, 0.2f ), { H, E } );
 	auto router_bias = upload_half_values( uniform_vec( rng, E, 0.1f ), { E } );
@@ -232,6 +274,16 @@ int main( int argc, char** argv ) {
 			else modules::MoE::forward( x, g_nv_full, d_idx, d_w, out, 0, E, sc_nv_full );
 			std::snprintf( nm, sizeof( nm ), "nvfp4%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
 			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
+		}
+		for ( int vt = 0; vt < 2; ++vt ) {
+			for ( int shard = 0; shard < 2; ++shard ) {
+				int os[2] = { m, H };
+				pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );
+				if ( shard ) modules::MoE::forward( x, g_ext_shard[vt], d_idx, d_w, out, 4, 12, sc_shard );
+				else modules::MoE::forward( x, g_ext_full[vt], d_idx, d_w, out, 0, E, sc_full );
+				std::snprintf( nm, sizeof( nm ), "ext%s%s_%s_m%d", vt ? "_volta" : "", softmax ? "_sm" : "", shard ? "shard" : "full", m );
+				cases.push_back( { nm, download_half( out.data, out.numel() ) } );
+			}
 		}
 	}
 

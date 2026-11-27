@@ -8,9 +8,16 @@
 // ending there. The codebook works on two windows at a time (FP16 pairs, as the CUDA kernels' decode_3inst_2). Stock order: lane L holds
 // rows 2 (L & 3) + {0, 1, 8, 9} of columns c0 = 2 (L >> 3) + ((L >> 2) & 1) (values 0 to 3) and c0 + 8 (4 to 7); Volta order: lane L holds
 // rows 8 ((L >> 3) & 1) + 0..7 of column 8 ((L >> 2) & 1) + 4 (L >> 4) + (L & 3).
+//
+// TR_EXT = 1 compiles the extended trellis' forms (GEMV and dequantization): a tile's optional start state (uint16) stands for the word before its
+// stream (its low 16 - K bits are the bits before the tile's first window, instead of the stream's end), an optional gain code c multiplies the
+// decoded values by (896 + c) / 1024 in FP16, as exl3_dq_ext.cuh does. The plain forms (TR_EXT = 0) are unchanged by it.
 
 #ifndef TR_CODE
 #define TR_CODE 4
+#endif
+#ifndef TR_EXT
+#define TR_EXT 0
 #endif
 static const int CODE = TR_CODE;
 static const bool HALF_RATE = CODE > 8;
@@ -60,12 +67,19 @@ struct TrWords { uint r0; uint r1; uint r2; };
 
 uint tr_shr64(uint hi, uint lo, int s) { return uint((((uint64_t)hi << 32) | (uint64_t)lo) >> uint(s)); }
 
-TrWords tr_words(uint* codes, int64_t tile, int lane) {
+TrWords tr_words(uint* codes, int64_t tile, int lane, bool has_start = false, uint start = 0u) {
 	let b = tr_end(lane * 8 + 7) + TILE_BITS;   // unwrapped by a tile: the words before it never go negative
 	let w = (b - 1) >> 5;
 	let wc = codes[tile + (w % TILE_WORDS)];
-	let wb = codes[tile + ((w - 1) % TILE_WORDS)];
-	let wa = codes[tile + ((w - 2) % TILE_WORDS)];
+	var wb = codes[tile + ((w - 1) % TILE_WORDS)];
+	var wa = codes[tile + ((w - 2) % TILE_WORDS)];
+#if TR_EXT
+	// a word before the tile's stream (unwrapped index below one tile) is the start state (the windows reach at most 15 bits into it)
+	if (has_start) {
+		if (w - 1 < TILE_WORDS) wb = start;
+		if (w - 2 < TILE_WORDS) wa = start;
+	}
+#endif
 	let s = (w + 1) * 32 - b;   // the last window ends s bits above the bottom of word w (0..31)
 	TrWords r;
 	r.r0 = tr_shr64(wb, wc, s);
@@ -86,6 +100,13 @@ uint tr_bits16(TrWords t, int c) {
 void tr_decode(TrWords t, int cb, out half2 v[4]) {
 	[ForceUnroll]
 	for (int j = 0; j < 4; ++j) v[j] = tr_pair(tr_bits16(t, tr_end(7) - tr_end(2 * j)), tr_bits16(t, tr_end(7) - tr_end(2 * j + 1)), cb);
+}
+
+// The extended trellis: tile ti's start state (uint16 at byte 2 ti, little-endian) and the gain of its code (exact in FP16)
+uint tr_start(uint8_t* starts, int64_t ti) { return uint(starts[2 * ti]) | (uint(starts[2 * ti + 1]) << 8); }
+half2 tr_gain(uint8_t* gains, int64_t ti) {
+	let g = half(float(896u + uint(gains[ti])) * (1.0f / 1024.0f));
+	return half2(g, g);
 }
 
 // ---- the rotations
@@ -120,7 +141,7 @@ void trellis_had128(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifor
 
 // ---- the GEMV: a workgroup of 128 per 16-column tile, its four warps taking four of every sixteen K tiles at a time; FP32 sums, FP16 out
 
-struct TrGemvParams { uint* codes; half* x; half* y; int m; int k; int n; int cb; int volta; };
+struct TrGemvParams { uint* codes; half* x; half* y; int m; int k; int n; int cb; int volta; int pad0; uint8_t* starts; uint8_t* gains; };   // starts / gains: TR_EXT only
 
 #ifndef TR_GEMV_ROWS
 #define TR_GEMV_ROWS 8
@@ -189,12 +210,27 @@ void trellis_gemv(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform 
 	for (int kt0 = TR_UNROLL * warp; kt0 < k_tiles; kt0 += TR_UNROLL * TR_WARPS) {
 		TrWords tw[TR_UNROLL];
 		[ForceUnroll]
-		for (int u = 0; u < TR_UNROLL; ++u) tw[u] = tr_words(p.codes, (int64_t(min(kt0 + u, k_tiles - 1)) * n_tiles + nt) * TILE_WORDS, lane);
+		for (int u = 0; u < TR_UNROLL; ++u) {
+			let ti = int64_t(min(kt0 + u, k_tiles - 1)) * n_tiles + nt;
+#if TR_EXT
+			let has_start = p.starts != nullptr;
+			tw[u] = tr_words(p.codes, ti * TILE_WORDS, lane, has_start, has_start ? tr_start(p.starts, ti) : 0u);
+#else
+			tw[u] = tr_words(p.codes, ti * TILE_WORDS, lane);
+#endif
+		}
 		[ForceUnroll]
 		for (int u = 0; u < TR_UNROLL; ++u) {
 			if (kt0 + u < k_tiles) {
 				half2 v[4];
 				tr_decode(tw[u], p.cb, v);
+#if TR_EXT
+				if (p.gains != nullptr) {
+					let g = tr_gain(p.gains, int64_t(kt0 + u) * n_tiles + nt);
+					[ForceUnroll]
+					for (int j = 0; j < 4; ++j) v[j] = v[j] * g;
+				}
+#endif
 				tr_accumulate(p.x, p.k, p.m, kt0 + u, lane, p.volta, v, acc);
 			}
 		}
@@ -246,7 +282,7 @@ void trellis_split_sum(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uni
 // ---- the dequantization for the matmul: W^T [n, k] FP16. A workgroup of 128 per four consecutive K tiles of a column tile, a warp per
 // tile: the 16 x 64 block staged in shared memory (half pairs, rows padded), then written as 16 rows of 128 contiguous bytes
 
-struct TrDequantParams { uint* codes; half* out_; int k; int n; int cb; int volta; };
+struct TrDequantParams { uint* codes; half* out_; int k; int n; int cb; int volta; uint8_t* starts; uint8_t* gains; };   // starts / gains: TR_EXT only
 
 static const int TR_DQ_STRIDE = 36;   // uint (half pairs) per staged row: 32 + 4
 groupshared uint s_dq[16 * TR_DQ_STRIDE];
@@ -262,7 +298,18 @@ void trellis_dequant(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifo
 	let kt0 = int(gid.x / uint(n_tiles)) * 4;
 	let kt = kt0 + w;
 	half2 v[4];
-	tr_decode(tr_words(p.codes, (int64_t(kt) * n_tiles + nt) * TILE_WORDS, lane), p.cb, v);
+	let ti = int64_t(kt) * n_tiles + nt;
+#if TR_EXT
+	let has_start = p.starts != nullptr;
+	tr_decode(tr_words(p.codes, ti * TILE_WORDS, lane, has_start, has_start ? tr_start(p.starts, ti) : 0u), p.cb, v);
+	if (p.gains != nullptr) {
+		let g = tr_gain(p.gains, ti);
+		[ForceUnroll]
+		for (int j = 0; j < 4; ++j) v[j] = v[j] * g;
+	}
+#else
+	tr_decode(tr_words(p.codes, ti * TILE_WORDS, lane), p.cb, v);
+#endif
 	if (p.volta != 0) {
 		// column 8 ((lane >> 2) & 1) + 4 (lane >> 4) + (lane & 3), rows 8 ((lane >> 3) & 1) + 0..7: four pairs
 		let col = 8 * ((lane >> 2) & 1) + 4 * (lane >> 4) + (lane & 3);

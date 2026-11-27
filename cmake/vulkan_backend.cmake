@@ -112,17 +112,23 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			list(GET vparts 2 vrows)
 			list(GET vparts 3 vunroll)
 			foreach(dot 0 1)
-				set(suffix "")
-				if(dot)
-					set(suffix "_dot")
-				endif()
-				set(sout ${SLANG_OUT}/${vname}_c${code}${suffix}.spv)
-				add_custom_command(OUTPUT ${sout}
-					COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -DTR_CODE=${code}
-						-DTR_GEMV_ROWS=${vrows} -DTR_UNROLL=${vunroll} -DTR_THREADS=256 -DTR_DOT=${dot} -o ${sout}
-					DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang
-					COMMENT "slangc ${vname} (code ${code}${suffix}) -> spirv")
-				list(APPEND VK_FLASH_SPV ${sout})
+				# and the extended trellis' forms (_ext: tile starts / gains, TR_EXT)
+				foreach(ext 0 1)
+					set(suffix "")
+					if(dot)
+						set(suffix "_dot")
+					endif()
+					if(ext)
+						set(suffix "${suffix}_ext")
+					endif()
+					set(sout ${SLANG_OUT}/${vname}_c${code}${suffix}.spv)
+					add_custom_command(OUTPUT ${sout}
+						COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -DTR_CODE=${code}
+							-DTR_GEMV_ROWS=${vrows} -DTR_UNROLL=${vunroll} -DTR_THREADS=256 -DTR_DOT=${dot} -DTR_EXT=${ext} -o ${sout}
+						DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/trellis.slang
+						COMMENT "slangc ${vname} (code ${code}${suffix}) -> spirv")
+					list(APPEND VK_FLASH_SPV ${sout})
+				endforeach()
 			endforeach()
 		endforeach()
 	endforeach()
