@@ -26,6 +26,14 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
 * **Sampled drafts (standard speculative sampling with the drafter's distribution) for sampled requests.** Offline on 147 held-out agent
   turns, against today's argmax drafts: T=1 / top-p 0.95 5.37 -> 5.66 tokens per round (+5.3%, best draft temperature 0.8); T=0.7 / top-p 0.8
   +1.5%.
+* **Speeding up the sampled step (T > 0).** Sampled decoding is slower only through speculation's acceptance; the step itself costs the same.
+  - Qwen3.8-27B without speculation: 47.3 tok/s greedy against 47.2-47.5 sampled (T=1 / top-p 0.95 / top-k 20, 8K prompts).
+  - With DFlash2 the argmax drafts are accepted less often by a sampled target: 5.82 -> 5.69, 6.92 -> 5.90, 5.57 -> 4.55 and 4.06 -> 2.74
+    tokens per round, a larger loss on harder prompts.
+  - GLM DFlash2 at T=0 against 0.7: 43.1 against 43.2 ms per round, 4.39 against 4.27 tokens per round.
+
+  The top-16 pass, its sync and the penalties (applied on the host over the top-16 candidates) cost nothing measurable. Sampled drafts (the
+  entry above) are the only way back.
 * **FastMTP-style MTP head retraining on Flash-Next.** It fixes heads whose accuracy decays when reused for later steps. Measured over 5,906
   rounds of Claude Code agent tasks (`/api/stats` `steps`): conditional acceptance 0.825, 0.831, 0.847, 0.857, 0.884, 0.867, 0.875 for
   steps 1-7. No decay to recover; step 1 is the limit.
