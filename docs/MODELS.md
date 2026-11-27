@@ -31,6 +31,8 @@ and the features shared by every model (prefix cache, expert tier, speculation, 
   fetched. `max_image_tokens` (default 1024 language-model tokens per image, 0 = off) sizes the tower's scratch; the tower runs on rank 0 and loads
   last, into what is left of the arena. Without a loaded tower an image part reaches the model as the note `[image omitted: this model cannot view
   images]`. `vision_cpu` runs the tower on the host CPU instead (every model but Gemma 4; [FEATURES.md](FEATURES.md#multimodal)).
+* Video: Qwen3.8 (27B, Flash-Next) and GLM-5.3-Flash take videos through the same tower, as OpenAI `video_url` parts (a file, decoded with
+  FFmpeg's libraries) or `video` parts with the frames; `max_video_tokens` (default 8192) bounds a video ([FEATURES.md](FEATURES.md#multimodal)).
 
 ## Qwen3.8-27B (`qwen3_5`)
 

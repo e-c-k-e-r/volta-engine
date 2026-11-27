@@ -65,6 +65,20 @@ struct ChatEvent {
 	double ttft_ms = 0.0, decode_tok_s = 0.0;
 };
 
+// One frame of a video: 8-bit RGB, rows of width x 3 bytes from the top, and its time in seconds from the video's start
+struct VideoFrame {
+	int width = 0;
+	int height = 0;
+	std::vector<uint8_t> rgb;
+	double time = 0.0;
+};
+
+// A video as its frames, all of one size, in order (the engine keeps them as given, resized to the model's canvas and paired into the tower's
+// temporal patches; past the max_video_tokens option evenly spaced frames drop)
+struct Video {
+	std::vector<VideoFrame> frames;
+};
+
 // Mono float PCM in [-1, 1]
 struct Speech {
 	std::vector<float> pcm;
@@ -88,10 +102,15 @@ public:
 	// ...; "stream" is ignored). The events come on the engine's scheduler thread; returning false from on_event cancels the reply. Returns the
 	// request's id, or 0 with *error set (nothing is called then)
 	uint64_t chat( const std::string& request_json, std::function<bool( const ChatEvent& )> on_event, std::string* error );
+	// With videos from the host: each {"type": "video"} content part without a source of its own takes the next of `videos`, in message
+	// order (as many parts as videos). Parts with sources are the server's: image_url and video_url as base64 data: URLs, video with a
+	// video file's data: URL or its frames' (and "timestamps" in seconds, or "fps"); video files need a build with FFmpeg
+	uint64_t chat( const std::string& request_json, const std::vector<Video>& videos, std::function<bool( const ChatEvent& )> on_event, std::string* error );
 	// Ends a reply early (its Finish event reports "cancelled"); unknown or finished ids are ignored
 	void cancel( uint64_t id );
 	// The prompt length a chat body renders to, or -1 with *error set
 	int count_tokens( const std::string& request_json, std::string* error );
+	int count_tokens( const std::string& request_json, const std::vector<Video>& videos, std::string* error );
 
 	// Speech: an OpenAI /v1/audio/speech body (input, voice, speed) with vall-e's fields (language, seed, cfg, cfg_prompt, steps, duration,
 	// temperature, ...; docs/TTS.md). Blocks the calling thread; one synthesis runs at a time

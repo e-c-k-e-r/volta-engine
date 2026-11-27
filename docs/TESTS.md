@@ -48,6 +48,7 @@ Benchmark baselines depend on the GPU power cap and clocks: record one per setti
 | `test_slang_cpu`, `test_slang_kernels` | 2 | partly | Slang kernels on CPU and as generated CUDA |
 | `test_jinja` | 2 | no | Jinja2 subset against reference Jinja2 renders of the Qwen, GLM and Gemma 4 chat templates (the 31B's and the newer one of the E4B checkpoints, with a block `set`) |
 | `test_image` | 2 | no | image decode, smart resize and patch layout against PIL / HF-layout references, GLM canvas sizes against exllamav3's (`tests/tools/gen_image_goldens.py`) |
+| `test_video` | 2 | no | video frame samples and canvases of Qwen3-VL's and GLM-5's video processors (`tests/tools/gen_video_goldens.py`), the `max_video_tokens` and tower limits, a step's temporal slots and times, and with FFmpeg a decoded clip's steps (`tests/data/video_rgb.mp4`) |
 | `test_output_parser` | 2 | no | reasoning / tool-call parser (Qwen, GLM, DeepSeek and Gemma 4 formats), chunking independence, template round trip |
 | `test_tui_view` | 2 | no | dashboard frames on every tab for full, partial and missing stats at normal and tiny terminal sizes; sparklines, gap histogram, expert heat map, alerts, slot picking, pause; key handling and scroll clamps |
 | `test_backend_tiers` | 1 | no | capability registry matches the declared module functions |

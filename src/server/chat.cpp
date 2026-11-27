@@ -135,21 +135,51 @@ namespace {
 
 using ImageList = std::vector<engine::runtime::GenerationRequest::Image>;
 
-// Replaces each image placeholder token by `count` copies, consuming counts in order, between begin_id and end_id when those are set
-// (Gemma 4's <|image> ... <image|>). Tokens of a prompt prefix expand the same way (the images of the prefix come first), which is how
-// checkpoint positions stay valid.
-std::vector<int> expand_image_tokens( const std::vector<int>& tokens, int pad_id, const ImageList& images, int begin_id = -1, int end_id = -1 ) {
-	if ( images.empty() || pad_id < 0 ) return tokens;
+// How a prompt's media placeholders expand. An image pad becomes its `count` pads (between Gemma 4's markers when those are set); a video's
+// placeholder becomes its run, the steps' pads among their timestamp text and markers (Qwen3-VL also drops the template's vision_start /
+// vision_end around the placeholder, since every step carries its own). Images and videos each expand in their own order; a prompt prefix
+// expands the same way (its media come first), which is how checkpoint positions stay valid.
+struct MediaTokens {
+	int image_pad = -1, image_begin = -1, image_end = -1;
+	std::vector<int> image_counts;
+	int video_pad = -1, wrap_begin = -1, wrap_end = -1;
+	std::vector<std::vector<int>> video_runs;
+	std::vector<std::vector<int>> video_starts;   // where each step's pads begin in its video's run
+};
+
+// Where an expanded image's or video step's pads begin: video -1 is image `index`, else step `index` of that video
+struct MediaSpan {
+	int video = -1;
+	int index = 0;
+	int start = 0;
+};
+
+std::vector<int> expand_media( const std::vector<int>& tokens, const MediaTokens& mt, std::vector<MediaSpan>* spans = nullptr ) {
+	if ( mt.image_counts.empty() && mt.video_runs.empty() ) return tokens;
 	std::vector<int> out;
 	out.reserve( tokens.size() );
-	size_t next = 0;
-	for ( int t : tokens ) {
-		if ( t == pad_id && next < images.size() ) {
-			if ( begin_id >= 0 ) out.push_back( begin_id );
-			out.insert( out.end(), images[next++].count, pad_id );
-			if ( end_id >= 0 ) out.push_back( end_id );
+	size_t img = 0, vid = 0;
+	for ( size_t i = 0; i < tokens.size(); ++i ) {
+		const int t = tokens[i];
+		if ( t == mt.image_pad && mt.image_pad >= 0 && img < mt.image_counts.size() ) {
+			if ( mt.image_begin >= 0 ) out.push_back( mt.image_begin );
+			if ( spans ) spans->push_back( { -1, static_cast<int>( img ), static_cast<int>( out.size() ) } );
+			out.insert( out.end(), mt.image_counts[img++], mt.image_pad );
+			if ( mt.image_end >= 0 ) out.push_back( mt.image_end );
 		}
-		else out.push_back( t );
+		else if ( t == mt.video_pad && mt.video_pad >= 0 && vid < mt.video_runs.size() ) {
+			if ( mt.wrap_begin >= 0 && !out.empty() && out.back() == mt.wrap_begin ) out.pop_back();
+			const int base = static_cast<int>( out.size() );
+			out.insert( out.end(), mt.video_runs[vid].begin(), mt.video_runs[vid].end() );
+			if ( spans ) {
+				for ( size_t k = 0; k < mt.video_starts[vid].size(); ++k ) spans->push_back( { static_cast<int>( vid ), static_cast<int>( k ), base + mt.video_starts[vid][k] } );
+			}
+			++vid;
+			if ( mt.wrap_end >= 0 && i + 1 < tokens.size() && tokens[i + 1] == mt.wrap_end ) ++i;
+		}
+		else {
+			out.push_back( t );
+		}
 	}
 	return out;
 }
@@ -169,26 +199,76 @@ const char* image_pad_name( engine::loader::ModelFamily fam ) {
 
 // GLM's shipped chat template only knows text (an image part renders as a "cannot process" reminder), so the image markers of
 // the model's processor are written into the conversation as text; the tokenizer turns them into the special tokens
-void inline_glm_image_markers( nlohmann::ordered_json& messages ) {
+void inline_glm_image_markers( nlohmann::ordered_json& messages, bool images, bool videos ) {
 	for ( auto& m : messages ) {
 		if ( !m.is_object() || !m.contains( "content" ) || !m["content"].is_array() ) continue;
 		for ( auto& part : m["content"] ) {
-			if ( part.is_object() && part.value( "type", std::string() ) == "image" ) {
-				part = { { "type", "text" }, { "text", "<|begin_of_image|><|image|><|end_of_image|>" } };
-			}
+			const std::string type = part.is_object() ? part.value( "type", std::string() ) : std::string();
+			if ( images && type == "image" ) part = { { "type", "text" }, { "text", "<|begin_of_image|><|image|><|end_of_image|>" } };
+			if ( videos && type == "video" ) part = { { "type", "text" }, { "text", "<|begin_of_video|><|video|><|end_of_video|>" } };
 		}
 	}
 }
 
-// Image parts as a text note, for a model loaded without a vision tower
-void omit_images( nlohmann::ordered_json& messages ) {
+// Image (or video) parts as a text note, for a model loaded without a vision tower (or one that takes no video)
+void omit_media( nlohmann::ordered_json& messages, const char* type, const char* note ) {
 	for ( auto& m : messages ) {
 		if ( !m.is_object() || !m.contains( "content" ) || !m["content"].is_array() ) continue;
 		for ( auto& part : m["content"] ) {
-			if ( part.is_object() && part.value( "type", std::string() ) == "image" )
-				part = { { "type", "text" }, { "text", "[image omitted: this model cannot view images]" } };
+			if ( part.is_object() && part.value( "type", std::string() ) == type ) part = { { "type", "text" }, { "text", note } };
 		}
 	}
+}
+
+// A video's placeholder and its steps' markers. Qwen3-VL: the template's vision_start video_pad vision_end becomes, per step,
+// "<t seconds>" vision_start video_pad x n vision_end (t: the mean of the step's two frame times); GLM-5: the template's video pad becomes,
+// per step, begin_of_image image x n end_of_image "t seconds" (t: the step's first frame time) inside begin_of_video ... end_of_video
+struct VideoMarkers {
+	int pad = -1, wrap_begin = -1, wrap_end = -1;
+	int step_begin = -1, step_pad = -1, step_end = -1;
+	bool time_after = false;
+};
+
+bool video_markers( engine::loader::ModelFamily fam, const engine::loader::Tokenizer& tok, VideoMarkers* out ) {
+	if ( fam == engine::loader::ModelFamily::QWEN ) {
+		out->pad = out->step_pad = tok.get_special_token( "<|video_pad|>" );
+		out->wrap_begin = out->step_begin = tok.get_special_token( "<|vision_start|>" );
+		out->wrap_end = out->step_end = tok.get_special_token( "<|vision_end|>" );
+		out->time_after = false;
+	}
+	else if ( fam == engine::loader::ModelFamily::GLM ) {
+		out->pad = tok.get_special_token( "<|video|>" );
+		out->step_begin = tok.get_special_token( "<|begin_of_image|>" );
+		out->step_pad = tok.get_special_token( "<|image|>" );
+		out->step_end = tok.get_special_token( "<|end_of_image|>" );
+		out->time_after = true;
+		if ( tok.get_special_token( "<|begin_of_video|>" ) < 0 || tok.get_special_token( "<|end_of_video|>" ) < 0 ) return false;
+	}
+	else {
+		return false;
+	}
+	return out->pad >= 0 && out->step_begin >= 0 && out->step_pad >= 0 && out->step_end >= 0;
+}
+
+// A video request part into its prepared steps: a file through FFmpeg, encoded frames, or the host's decoded frames
+bool prepare_request_video( const ChatRequest::Video& v, const engine::loader::VisionParams& vp, engine::loader::PreparedVideo* out, std::string* why ) {
+	const int budget = runtime::options().max_video_tokens;
+	if ( !v.file.empty() ) return engine::loader::decode_video( reinterpret_cast<const uint8_t*>( v.file.data() ), v.file.size(), vp, budget, out, why );
+	if ( v.decoded ) return engine::loader::prepare_video( *v.decoded, vp, budget, out, why );
+	if ( v.frames.empty() ) {
+		*why = "a video part needs video_url, or video with a file's or its frames' data: URLs";
+		return false;
+	}
+	engine::loader::VideoFrames frames;
+	frames.frames.resize( v.frames.size() );
+	frames.times = v.times;
+	for ( size_t i = 0; i < v.frames.size(); ++i ) {
+		if ( !engine::loader::decode_image( reinterpret_cast<const uint8_t*>( v.frames[i].data() ), v.frames[i].size(), &frames.frames[i], why ) ) {
+			*why += " (a video frame: JPEG, PNG, BMP and GIF are supported)";
+			return false;
+		}
+	}
+	return engine::loader::prepare_video( frames, vp, budget, out, why );
 }
 
 // Gemma 4's template takes tool results as tool_responses ({ name, response }) on the tool message: the results of consecutive tool
@@ -284,8 +364,8 @@ PromptModel prompt_model( engine::runtime::Generator& gen ) {
 		[&gen]( const engine::runtime::GenerationRequest::Image& im ) { gen.prefetch_image( im ); } };
 }
 
-bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images, ApiError* err,
-	std::string* vars_json = nullptr ) {
+bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens, ImageList* images,
+	MediaTokens* media, ApiError* err, std::string* vars_json = nullptr ) {
 	const auto family = m.chat_template.model_family();
 
 	bool thinking = req.enable_thinking >= 0 ? req.enable_thinking != 0 : cfg.default_enable_thinking;
@@ -301,7 +381,11 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 	if ( vars["messages"].is_array() ) fold_system_messages( vars["messages"], !takes_later_system( m.chat_template ) );
 	// Without a vision tower an image part becomes a note in the text, so an agent that reads an image file carries on instead of failing
 	const bool see = !req.images.empty() && m.vision && m.tokenizer.get_special_token( image_pad_name( family ) ) >= 0;
-	if ( !req.images.empty() && !see && vars["messages"].is_array() ) omit_images( vars["messages"] );
+	if ( !req.images.empty() && !see && vars["messages"].is_array() ) omit_media( vars["messages"], "image", "[image omitted: this model cannot view images]" );
+	// Videos: a tower whose checkpoint ships a video processor (Qwen3-VL, GLM-5), and the family's markers
+	VideoMarkers vm;
+	const bool watch = !req.videos.empty() && m.vision && m.vision->video && runtime::options().max_video_tokens > 0 && video_markers( family, m.tokenizer, &vm );
+	if ( !req.videos.empty() && !watch && vars["messages"].is_array() ) omit_media( vars["messages"], "video", "[video omitted: this model cannot view videos]" );
 	if ( family == engine::loader::ModelFamily::GEMMA ) {
 		if ( vars["messages"].is_array() ) gemma_tool_messages( vars["messages"] );
 		vars["bos_token"] = m.tokenizer.decode_token( m.tokenizer.get_special_token( "<bos>" ) );
@@ -337,7 +421,7 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 		if ( vars.contains( "tools" ) ) escape_control_text( vars["tools"], ctl );
 	}
 	// After the escaping: the markers are the model's own special tokens, not text a user typed
-	if ( family == engine::loader::ModelFamily::GLM && see && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"] );
+	if ( family == engine::loader::ModelFamily::GLM && ( see || watch ) && vars["messages"].is_array() ) inline_glm_image_markers( vars["messages"], see, watch );
 	std::string terr;
 	if ( vars_json ) *vars_json = vars.dump();
 	if ( !m.chat_template.render_json( vars.dump(), prompt, &terr ) ) {
@@ -347,6 +431,11 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 	// The GLM template always opens <think>; non-thinking mode closes it right away (GLM-4.5 convention)
 	if ( !thinking && family == engine::loader::ModelFamily::GLM && ends_with( *prompt, "<think>" ) ) *prompt += "</think>";
 	*tokens = encode_prompt( m.tokenizer, *prompt );
+	MediaTokens local;
+	MediaTokens& mt = media ? *media : local;
+	mt = MediaTokens();
+	ImageList stills;
+	std::vector<ImageList> steps;
 	if ( see ) {
 		const engine::loader::VisionParams* vp = m.vision;
 		const int pad_id = m.tokenizer.get_special_token( image_pad_name( family ) );
@@ -365,28 +454,73 @@ bool render_prompt( const PromptModel& m, const ServerConfig& cfg, const ChatReq
 			im.count = vp->deepseek ? prep->span_tokens() : im.grid_h * im.grid_w;   // DeepSeek: the delimiters and newlines are part of the span
 			im.hash = prep->hash;
 			im.prepared = std::move( prep );
-			images->push_back( std::move( im ) );
+			mt.image_counts.push_back( im.count );
+			stills.push_back( std::move( im ) );
 		}
 		size_t pads = 0;
 		for ( int t : *tokens ) pads += ( t == pad_id ) ? 1 : 0;
-		if ( pads != images->size() ) {
-			err->message = "the conversation holds " + std::to_string( images->size() ) + " images but the chat template placed " + std::to_string( pads ) + " (images are only allowed in user and tool messages)";
+		if ( pads != stills.size() ) {
+			err->message = "the conversation holds " + std::to_string( stills.size() ) + " images but the chat template placed " + std::to_string( pads ) + " (images are only allowed in user and tool messages)";
 			return false;
+		}
+		mt.image_pad = pad_id;
+		image_markers( family, m.tokenizer, &mt.image_begin, &mt.image_end );
+	}
+	if ( watch ) {
+		const engine::loader::VisionParams& vp = *m.vision;
+		size_t pads = 0;
+		for ( int t : *tokens ) pads += ( t == vm.pad ) ? 1 : 0;
+		if ( pads != req.videos.size() ) {
+			err->message = "the conversation holds " + std::to_string( req.videos.size() ) + " videos but the chat template placed " + std::to_string( pads ) + " (videos are only allowed in user and tool messages)";
+			return false;
+		}
+		mt.video_pad = vm.pad;
+		mt.wrap_begin = vm.wrap_begin;
+		mt.wrap_end = vm.wrap_end;
+		for ( const ChatRequest::Video& v : req.videos ) {
+			engine::loader::PreparedVideo pv;
+			std::string verr;
+			if ( !prepare_request_video( v, vp, &pv, &verr ) ) {
+				err->message = verr;
+				return false;
+			}
+			const int n = pv.tokens_per_step( vp.merge_size );
+			std::vector<int> run, starts;
+			ImageList list;
+			for ( size_t k = 0; k < pv.steps.size(); ++k ) {
+				char stamp[48];
+				std::snprintf( stamp, sizeof( stamp ), vm.time_after ? "%.1f seconds" : "<%.1f seconds>", pv.times[k] );
+				const std::vector<int> text = m.tokenizer.encode( stamp, false );
+				if ( !vm.time_after ) run.insert( run.end(), text.begin(), text.end() );
+				run.push_back( vm.step_begin );
+				starts.push_back( static_cast<int>( run.size() ) );
+				run.insert( run.end(), n, vm.step_pad );
+				run.push_back( vm.step_end );
+				if ( vm.time_after ) run.insert( run.end(), text.begin(), text.end() );
+				engine::runtime::GenerationRequest::Image im;
+				im.grid_h = pv.steps[k].grid_h / vp.merge_size;
+				im.grid_w = pv.steps[k].grid_w / vp.merge_size;
+				im.count = n;
+				im.hash = pv.steps[k].hash;
+				im.prepared = std::make_shared<engine::loader::PreparedImage>( std::move( pv.steps[k] ) );
+				list.push_back( std::move( im ) );
+			}
+			mt.video_runs.push_back( std::move( run ) );
+			mt.video_starts.push_back( std::move( starts ) );
+			steps.push_back( std::move( list ) );
+		}
+	}
+	if ( see || watch ) {
+		std::vector<MediaSpan> spans;
+		*tokens = expand_media( *tokens, mt, &spans );
+		// the images and video steps in prompt order, each where its pads begin
+		for ( const MediaSpan& sp : spans ) {
+			engine::runtime::GenerationRequest::Image& im = sp.video < 0 ? stills[sp.index] : steps[sp.video][sp.index];
+			im.start = sp.start;
+			images->push_back( std::move( im ) );
 		}
 		// vision_cpu encodes here, on the request's own thread, before the request queues for a slot
 		if ( m.prefetch_image ) for ( const auto& im : *images ) m.prefetch_image( im );
-		int img_begin = -1, img_end = -1;
-		image_markers( family, m.tokenizer, &img_begin, &img_end );
-		*tokens = expand_image_tokens( *tokens, pad_id, *images, img_begin, img_end );
-		int at = 0, k = 0;
-		for ( size_t i = 0; i < tokens->size(); ++i ) {
-			if ( ( *tokens )[i] != pad_id ) continue;
-			if ( at == 0 ) ( *images )[k].start = static_cast<int>( i );
-			if ( ++at == ( *images )[k].count ) {
-				at = 0;
-				++k;
-			}
-		}
 	}
 	const int ctx = m.max_context;
 	if ( req.strict_context && static_cast<int>( tokens->size() ) >= reply_window( ctx ) ) {
@@ -417,7 +551,7 @@ void dump_prompt( engine::runtime::Generator& gen, const std::string& prompt, ui
 bool render_chat_prompt( const PromptModel& model, const ServerConfig& cfg, const ChatRequest& req, std::string* prompt, std::vector<int>* tokens,
 	ApiError* err, std::string* vars_json ) {
 	ImageList images;
-	return render_prompt( model, cfg, req, prompt, tokens, &images, err, vars_json );
+	return render_prompt( model, cfg, req, prompt, tokens, &images, nullptr, err, vars_json );
 }
 
 std::string shown_prompt( const engine::loader::Tokenizer& tok, const std::string& prompt ) {
@@ -429,7 +563,7 @@ bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg
 	std::string prompt;
 	std::vector<int> ids;
 	ImageList images;
-	if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &ids, &images, err ) ) return false;
+	if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &ids, &images, nullptr, err ) ) return false;
 	dump_prompt( gen, prompt, request_id );
 	*tokens = static_cast<int>( ids.size() );
 	return true;
@@ -453,6 +587,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	std::string prompt;
 	std::vector<int> tokens;
 	ImageList images;
+	MediaTokens media;
 	if ( req.raw ) {
 		// a text completion: the prompt as given, no chat template
 		if ( req.raw_tokens.empty() ) {
@@ -480,7 +615,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		}
 		responder->on_raw_prompt( prompt );
 	}
-	else if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &tokens, &images, err ) ) return false;
+	else if ( !render_prompt( prompt_model( gen ), cfg, req, &prompt, &tokens, &images, &media, err ) ) return false;
 	responder->on_prompt( static_cast<int>( tokens.size() ) );
 	dump_prompt( gen, prompt, request_id );
 
@@ -552,12 +687,9 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	// reply there, so the end of the whole prompt is never a prefix of it but this boundary is.
 	{
 		const bool glm = family == engine::loader::ModelFamily::GLM;
-		const int pad_id = gen.tokenizer().get_special_token( image_pad_name( family ) );
-		int img_begin = -1, img_end = -1;
-		image_markers( family, gen.tokenizer(), &img_begin, &img_end );
 		auto add = [&]( size_t at, bool pinned, size_t min_tokens ) {
 			if ( at == std::string::npos || at == 0 ) return;
-			const std::vector<int> head = expand_image_tokens( encode_prompt( gen.tokenizer(), prompt.substr( 0, at ) ), pad_id, g.images, img_begin, img_end );
+			const std::vector<int> head = expand_media( encode_prompt( gen.tokenizer(), prompt.substr( 0, at ) ), media );
 			if ( head.size() < min_tokens || head.size() >= g.prompt_tokens.size() ) return;
 			if ( !std::equal( head.begin(), head.end(), g.prompt_tokens.begin() ) ) return;
 			if ( !g.checkpoint_at.empty() && static_cast<int>( head.size() ) <= g.checkpoint_at.back().pos ) return;

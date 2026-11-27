@@ -4,6 +4,7 @@
 #include "engine/server/config.h"
 #include "engine/server/http.h"
 #include "engine/server/output_parser.h"
+#include "engine/loader/video.h"
 
 #include <nlohmann/json.hpp>
 #include <atomic>
@@ -32,6 +33,15 @@ struct ChatRequest {
 	// tool result shows their definition there
 	std::vector<std::string> deferred_tools;
 	std::vector<std::string> images; // encoded image files in prompt order; messages_json refers to them as {"type": "image"} parts
+	// Videos in prompt order, {"type": "video"} parts in messages_json: a video file, or its frames (encoded images, or the host's decoded
+	// ones through libvolta) with their times in seconds
+	struct Video {
+		std::string file;
+		std::vector<std::string> frames;
+		std::vector<double> times;
+		std::shared_ptr<const engine::loader::VideoFrames> decoded;
+	};
+	std::vector<Video> videos;
 	// a text completion (OpenAI /v1/completions): the prompt as given instead of messages through the chat template (its special-token strings
 	// are those tokens, nothing is prepended), and the reply as plain text (no reasoning or tool-call parsing)
 	bool raw = false;

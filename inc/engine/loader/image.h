@@ -35,7 +35,23 @@ struct VisionParams {
 	// Gemma 4: aspect-preserving resize to whole merge_size x merge_size cells of patches, at most max_tokens soft tokens; raster patches
 	// ([y][x][channel] within a patch, values 2 * v / 255 - 1); a soft token pools merge_size x merge_size patches
 	bool gemma = false;
+	// Video (the checkpoint's video processor: Qwen3-VL's video_preprocessor_config.json, GLM-5's processor_config.json video_processor):
+	// frames sampled at video_fps within [video_min_frames, video_max_frames], two frames a temporal patch. Qwen3-VL: frames x height x width
+	// within [video_min_pixels, video_max_pixels], at most video_frame_tokens tokens a frame; GLM-5 (canvas): the canvas within
+	// [video_min_tokens, video_max_tokens] language-model tokens
+	bool video = false;
+	double video_fps = 2.0;
+	int video_min_frames = 4;
+	int video_max_frames = 768;
+	int64_t video_min_pixels = 4096;
+	int64_t video_max_pixels = 25165824;
+	int video_frame_tokens = 768;
+	int video_min_tokens = 16;
+	int video_max_tokens = 240000;
 };
+
+// The video processor of a Qwen3-VL or GLM-5 checkpoint into p (sets p->video when model_dir has one)
+void read_video_params( const std::string& model_dir, VisionParams* p );
 
 // An image resized to the patch grid and cut into patches, ready for the vision tower.
 struct PreparedImage {

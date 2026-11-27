@@ -126,8 +126,21 @@ Covered by `test_all_reduce`, `bench_all_reduce`, `test_coherence`, `tests/4_ser
   `test_host_vision` (the host tower against the device tower and, with an mmproj directory, against the BF16 weights) and `test_host_attention`.
 * The vision tower of a Volta-order EXL3 checkpoint is read in the stock tile order (`model.visual.*`: the quantizer skips it, see [QUANTIZATION.md](QUANTIZATION.md));
   read in the Volta order its embeddings are noise.
+* Video (Qwen, Flash-Next and GLM, whose checkpoints ship a video processor: Qwen3-VL's `video_preprocessor_config.json`, GLM-5's
+  `video_processor` in `processor_config.json`): an OpenAI `video_url` part (a video file's base64 `data:` URL, decoded with FFmpeg's libraries
+  where the build has them) or a `video` part with the file's `data:` URL or its frames' (images, with `timestamps` in seconds or an `fps`,
+  default 2); libvolta takes the frames from the host. A file's frames are sampled as the processor samples them (Qwen: 2 a second, evenly
+  spaced, 4 to 768; GLM: one every half second, up to 2048, an even count) and decoded one at a time; frames given are kept as given. All of a
+  video's frames take one canvas: the processor's budget (Qwen: frames x pixels within its edges, at most 768 tokens a frame; GLM: the
+  token-budget canvas with its zero padding), each step at most the tower's largest image (`max_image_tokens`, or `vision_cpu`) and the whole
+  video at most `max_video_tokens` (default 8192, 0 = off; past that, evenly spaced frames drop). Two frames make one step, the tower's
+  temporal patch, encoded as an image of its own (both towers attend within a frame pair); each step is placed as the processors place it:
+  Qwen `<t seconds>` and its tokens between vision_start / vision_end, with its own M-RoPE grid, t the mean of its two frames' times; GLM its
+  tokens between begin_of_image / end_of_image followed by `t seconds`, inside begin_of_video / end_of_video, t its first frame's time.
+  Steps are cached and keyed like images. A model without video gets the note `[video omitted: this model cannot view videos]`. Covered by
+  `test_video`.
 * Embeddings are cached by content hash (1 GiB of host RAM), and prefix-cache keys use the image content instead of the placeholder ids.
-* Covered by `test_vision`, `test_ops_vision`, `test_image`, `test_dsv41_vision`, `test_gemma4_vision`, `test_api.sh`.
+* Covered by `test_vision`, `test_ops_vision`, `test_image`, `test_video`, `test_dsv41_vision`, `test_gemma4_vision`, `test_api.sh`.
 
 ## Serving
 

@@ -65,6 +65,7 @@ tier2_fast() {
 	run all_reduce_2ranks sh -c "AR_RANKS=2 taskset -c 0-9 ./test_all_reduce"
 	run jinja_chat_templates ./test_jinja
 	run image_preprocess ./test_image
+	run video_preprocess ./test_video
 	run output_parser ./test_output_parser
 	run tui_view ./test_tui_view
 	run backend_tiers ./test_backend_tiers $ROOT

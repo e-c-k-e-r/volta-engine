@@ -20,8 +20,52 @@ bool fail( ApiError* err, const std::string& message, const char* type = "invali
 	return false;
 }
 
+// The bytes of a base64 data: URL
+bool data_url( const std::string& url, std::string* bytes, const char* what, ApiError* err ) {
+	const size_t comma = url.find( ',' );
+	if ( url.compare( 0, 5, "data:" ) != 0 || comma == std::string::npos || url.find( ";base64" ) > comma ) {
+		return fail( err, std::string( what ) + " must be a base64 data: URL (remote URLs are not fetched)" );
+	}
+	if ( !engine::loader::base64_decode( url.substr( comma + 1 ), bytes ) || bytes->empty() ) return fail( err, std::string( what ) + " holds invalid base64" );
+	return true;
+}
+
+// A video part: video_url (a video file's data: URL), or video with a file's data: URL, the frames' data: URLs (times from "timestamps", in
+// seconds, or "fps", default 2), or nothing (libvolta: the host's next video)
+bool video_part( const json& p, ChatRequest::Video* v, ApiError* err ) {
+	if ( p.value( "type", std::string() ) == "video_url" ) {
+		const json& vu = p.contains( "video_url" ) ? p["video_url"] : json();
+		const std::string url = vu.is_string() ? vu.get<std::string>() : ( vu.is_object() ? vu.value( "url", std::string() ) : std::string() );
+		return data_url( url, &v->file, "video_url", err );
+	}
+	if ( !p.contains( "video" ) ) return true;
+	const json& src = p["video"];
+	if ( src.is_string() ) return data_url( src.get<std::string>(), &v->file, "video", err );
+	if ( !src.is_array() || src.empty() ) return fail( err, "video must be a data: URL or a non-empty array of frame data: URLs" );
+	for ( const auto& f : src ) {
+		const std::string url = f.is_string() ? f.get<std::string>() : ( f.is_object() ? f.value( "url", std::string() ) : std::string() );
+		std::string bytes;
+		if ( !data_url( url, &bytes, "a video frame", err ) ) return false;
+		v->frames.push_back( std::move( bytes ) );
+	}
+	if ( p.contains( "timestamps" ) ) {
+		const json& ts = p["timestamps"];
+		if ( !ts.is_array() || ts.size() != src.size() ) return fail( err, "video timestamps need one number per frame" );
+		for ( const auto& t : ts ) {
+			if ( !t.is_number() ) return fail( err, "video timestamps need one number per frame" );
+			v->times.push_back( t.get<double>() );
+		}
+	}
+	else {
+		const double fps = p.contains( "fps" ) && p["fps"].is_number() ? p["fps"].get<double>() : 2.0;
+		if ( !( fps > 0.0 ) ) return fail( err, "video fps must be positive" );
+		for ( size_t i = 0; i < src.size(); ++i ) v->times.push_back( i / fps );
+	}
+	return true;
+}
+
 // OpenAI content (string | null | [parts]) -> template content (string | [text parts])
-bool normalize_content( const json& c, json* out, std::vector<std::string>* images, ApiError* err ) {
+bool normalize_content( const json& c, json* out, std::vector<std::string>* images, std::vector<ChatRequest::Video>* videos, ApiError* err ) {
 	if ( c.is_null() ) {
 		*out = "";
 		return true;
@@ -42,17 +86,19 @@ bool normalize_content( const json& c, json* out, std::vector<std::string>* imag
 		else if ( p.is_object() && p.value( "type", std::string() ) == "image_url" ) {
 			const json& iu = p.contains( "image_url" ) ? p["image_url"] : json();
 			const std::string url = iu.is_string() ? iu.get<std::string>() : ( iu.is_object() ? iu.value( "url", std::string() ) : std::string() );
-			const size_t comma = url.find( ',' );
 			std::string bytes;
-			if ( url.compare( 0, 5, "data:" ) != 0 || comma == std::string::npos || url.find( ";base64" ) > comma ) {
-				return fail( err, "image_url must be a base64 data: URL (remote URLs are not fetched)" );
-			}
-			if ( !engine::loader::base64_decode( url.substr( comma + 1 ), &bytes ) || bytes.empty() ) return fail( err, "image_url holds invalid base64" );
+			if ( !data_url( url, &bytes, "image_url", err ) ) return false;
 			images->push_back( std::move( bytes ) );
 			parts.push_back( { { "type", "image" } } );
 		}
+		else if ( p.is_object() && ( p.value( "type", std::string() ) == "video_url" || p.value( "type", std::string() ) == "video" ) ) {
+			ChatRequest::Video v;
+			if ( !video_part( p, &v, err ) ) return false;
+			videos->push_back( std::move( v ) );
+			parts.push_back( { { "type", "video" } } );
+		}
 		else if ( p.is_object() && p.contains( "type" ) && p["type"].is_string() ) {
-			return fail( err, "unsupported content part type '" + p["type"].get<std::string>() + "' (text and image_url are supported)" );
+			return fail( err, "unsupported content part type '" + p["type"].get<std::string>() + "' (text, image_url, video_url and video are supported)" );
 		}
 		else {
 			return fail( err, "malformed content part" );
@@ -62,7 +108,7 @@ bool normalize_content( const json& c, json* out, std::vector<std::string>* imag
 	return true;
 }
 
-bool normalize_messages( const json& messages, json* out, std::vector<std::string>* images, ApiError* err ) {
+bool normalize_messages( const json& messages, json* out, std::vector<std::string>* images, std::vector<ChatRequest::Video>* videos, ApiError* err ) {
 	if ( !messages.is_array() || messages.empty() ) return fail( err, "messages must be a non-empty array" );
 	*out = json::array();
 	for ( const auto& m : messages ) {
@@ -73,7 +119,7 @@ bool normalize_messages( const json& messages, json* out, std::vector<std::strin
 		json nm = json::object();
 		nm["role"] = role;
 		json content;
-		if ( !normalize_content( m.contains( "content" ) ? m["content"] : json(), &content, images, err ) ) return false;
+		if ( !normalize_content( m.contains( "content" ) ? m["content"] : json(), &content, images, videos, err ) ) return false;
 		nm["content"] = content;
 		if ( role == "assistant" ) {
 			for ( const char* key : { "reasoning_content", "reasoning" } ) {
@@ -336,7 +382,7 @@ public:
 		r.model = j.value( "model", std::string() );
 		if ( !j.contains( "messages" ) ) return fail( err, "messages is required" );
 		json messages;
-		if ( !normalize_messages( j["messages"], &messages, &r.images, err ) ) return false;
+		if ( !normalize_messages( j["messages"], &messages, &r.images, &r.videos, err ) ) return false;
 		r.messages_json = messages.dump();
 
 		bool tools_off = j.contains( "tool_choice" ) && j["tool_choice"].is_string() && j["tool_choice"] == "none";

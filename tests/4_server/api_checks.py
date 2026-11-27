@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Black-box checks of the chat APIs against a running volta_server (OpenAI /v1/chat/completions, and /v1/messages when
 # the server routes it). Usage: python3 -I api_checks.py http://127.0.0.1:8000
-import base64, json, os, sys, urllib.request, urllib.error, socket, time
+import base64, json, os, struct, sys, urllib.request, urllib.error, socket, time, zlib
 
 BASE = sys.argv[1].rstrip("/")
 failures = 0
@@ -277,6 +277,30 @@ if True:
     check(code == 200 and json.loads(body)["input_tokens"] > 300, "count_tokens includes the image tokens", body)
     code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}]}]})
     check(code == 400, "remote image URLs are rejected", body)
+# ---- video (each model's video processor: tests/data/video_rgb.mp4 is a red, a green and a blue second)
+VID = base64.b64encode(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "video_rgb.mp4"), "rb").read()).decode()
+def colors_in_order(text):
+    t = text.lower()
+    at = [t.find(c) for c in ("red", "green", "blue")]
+    return all(i >= 0 for i in at) and at == sorted(at)
+VQ = "The video shows three solid colors, one after another. Name them in order, separated by commas."
+code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "video_url", "video_url": {"url": "data:video/mp4;base64," + VID}}, {"type": "text", "text": VQ}]}], "max_tokens": 24})
+v1 = json.loads(body)["choices"][0]["message"]["content"] if code == 200 else body
+check(code == 200 and colors_in_order(v1), "OpenAI video_url: the model sees the colors in order", v1)
+FRAMES = []
+for rgb in ((255, 0, 0), (0, 255, 0), (0, 0, 255)):
+    # a 32 x 32 solid PNG frame: one IDAT of filtered rows, zlib-compressed
+    raw = b"".join(b"\x00" + bytes(rgb) * 32 for _ in range(32))
+    chunk = lambda tag, data: struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xffffffff)
+    png = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 32, 32, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+    FRAMES += ["data:image/png;base64," + base64.b64encode(png).decode()] * 2
+code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "video", "video": FRAMES, "fps": 2}, {"type": "text", "text": VQ}]}], "max_tokens": 24})
+v2 = json.loads(body)["choices"][0]["message"]["content"] if code == 200 else body
+check(code == 200 and colors_in_order(v2), "video as frames: the model sees the colors in order", v2)
+code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "video", "video": FRAMES, "timestamps": [0]}]}]})
+check(code == 400, "video timestamps need one per frame", body)
+code, body = post("/v1/chat/completions", {"messages": [{"role": "user", "content": [{"type": "video"}, {"type": "text", "text": "hi"}]}]})
+check(code == 400, "a video part without a source is refused (the server has no host frames)", body)
 code, body = post("/v1/messages", {"model": "claude-x", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
                                    "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}]})
 check(code == 400 and "server tool" in json.loads(body)["error"]["message"], "Anthropic server tools are refused by name", body)

@@ -59,6 +59,7 @@ bool glm5_vision_config( const char* model_dir, int max_patches, Glm5VisionConfi
 		}
 		params.min_pixels = ip.value( "min_image_tokens", 16 ) * cfg.merge_size * cfg.merge_size * cfg.patch_size * cfg.patch_size;
 	}
+	engine::loader::read_video_params( model_dir, &params );
 	*out_cfg = cfg;
 	*out_params = params;
 	return true;

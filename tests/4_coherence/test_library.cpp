@@ -1,5 +1,5 @@
-// libvolta from a host's side: links libvolta.so and includes volta/volta.h alone. A streamed chat, a tool call, count_tokens, a cancelled
-// reply; with speech, a line spoken to a WAV, that speech added as a voice and a second line in it, and speak_async. --adopt: the test makes
+// libvolta from a host's side: links libvolta.so and includes volta/volta.h alone. A streamed chat, a tool call, count_tokens (also with a
+// video from the host's frames), a cancelled reply; with speech, a line spoken to a WAV, that speech added as a voice and a second line in it, and speak_async. --adopt: the test makes
 // its own Vulkan instance and device, as a game would, and hands them to the engine.
 // --adopt-bad: the host's device lacks shaderInt64, which create must refuse with an error naming it.
 //   test_library <launch config> [--adopt | --adopt-bad] [--out <dir>]
@@ -269,6 +269,24 @@ int main( int argc, char** argv ) {
 		}
 		const int n = engine->count_tokens( R"({"messages":[{"role":"user","content":"Hello there"}]})", &error );
 		check( n > 2 && n < 64, "count_tokens" );
+		{
+			// a video from the host's frames: one sourceless part takes it (a model without video renders its note instead); a part with no
+			// video given is an error
+			volta::Video clip;
+			for ( int i = 0; i < 4; ++i ) {
+				volta::VideoFrame f;
+				f.width = 64;
+				f.height = 48;
+				f.rgb.assign( static_cast<size_t>( 64 ) * 48 * 3, static_cast<uint8_t>( 60 * i ) );
+				f.time = 0.5 * i;
+				clip.frames.push_back( std::move( f ) );
+			}
+			const char* body = R"({"messages":[{"role":"user","content":[{"type":"video"},{"type":"text","text":"What happens?"}]}]})";
+			const int nv = engine->count_tokens( body, { clip }, &error );
+			check( nv > n, "count_tokens with the host's video" );
+			std::string verr;
+			check( engine->count_tokens( body, {}, &verr ) < 0 && !verr.empty(), "a video part without a video is an error" );
+		}
 		check( engine->chat( "{ not json", Reply().handler(), &error ) == 0 && !error.empty(), "a bad body is an error" );
 	}
 

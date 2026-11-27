@@ -40,6 +40,11 @@ auto engine = volta::Engine::create( config_json, &error );   // or ( config_jso
   Content and Reasoning deltas, ToolCall (name and a JSON object of arguments), and a final Finish with `finish_reason` (`stop`, `length`,
   `tool_calls`, `cancelled`) and the usage (prompt / cached / completion tokens, time to first token, decode rate). Returning false from
   `on_event` cancels the reply; so does `cancel( id )`. `count_tokens( request_json, error )` is the prompt length a body renders to.
+- Video: `chat( request_json, videos, on_event, error )` and `count_tokens( request_json, videos, error )` take the host's videos as frames
+  (`volta::Video`: `VideoFrame`s of 8-bit RGB, one size, each with its time in seconds); each `{"type": "video"}` content part without a
+  source of its own takes the next one, in message order. The engine pairs them into the tower's temporal patches on the model's canvas,
+  as the server does for a video's frames ([FEATURES.md](FEATURES.md#multimodal)). Parts with sources work as in the server (`video_url`
+  files need a library built with FFmpeg's libraries, which it then links).
 - Speech: `speak( request_json, &speech, error )` takes a `/v1/audio/speech` body (input, voice, speed, and vall-e's language, seed, cfg,
   cfg_prompt, steps, duration, temperature, ...; [TTS.md](TTS.md)), blocks the calling thread and returns mono float PCM with its sample rate
   and the seed it was sampled with. One synthesis runs at a time. `speak_async( request_json, done )` queues it on the engine's speech
@@ -70,7 +75,7 @@ The arena is sized from the memory the device reports free (`VK_EXT_memory_budge
 ## The test
 
 `test_library <launch config> [--adopt | --adopt-bad] [--out <dir>]` links `libvolta.so` and includes `volta/volta.h` alone: log lines reach
-the callback, a second Engine is refused, a streamed chat, a tool call, cancelling from the callback and with `cancel`, `count_tokens`, a bad
-body; with speech, a line spoken to `library_speech.wav`, that speech added as a voice and a second line spoken in it, `speak_async`, and a
+the callback, a second Engine is refused, a streamed chat, a tool call, cancelling from the callback and with `cancel`, `count_tokens` (also
+with a video of the host's frames, and a video part without one refused), a bad body; with speech, a line spoken to `library_speech.wav`, that speech added as a voice and a second line spoken in it, `speak_async`, and a
 bad speech body. `--adopt` creates the test's own Vulkan instance and device first, as a game would, and runs the same checks on it;
 `--adopt-bad` creates it without `shaderInt64` and expects `create` to refuse it by name.

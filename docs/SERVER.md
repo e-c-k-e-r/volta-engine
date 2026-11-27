@@ -64,6 +64,9 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
   * a tool result's `is_error` adds nothing to its text
   * for Gemma 4 the tool results of consecutive tool messages go into one message's `tool_responses`, named after the calls they answer, as its template expects
   * without a loaded vision tower an image part becomes the text note `[image omitted: this model cannot view images]`, so a request with images still runs
+  * a video part becomes its steps: decoded (a file) or taken as frames, cut onto one canvas and paired into the tower's temporal patches; each
+    step is an image of its own in the request, its placeholder run and timestamp text as the model's processor writes them
+    ([FEATURES.md](FEATURES.md#multimodal)); without video in the model it becomes `[video omitted: this model cannot view videos]`
 * `openai.cpp`, `anthropic.cpp`: the protocol front ends (OpenAI chat and text completion, Anthropic messages). Each parses its payload into a chat request, and writes one response (streamed or not) from parsed pieces as they arrive; a text completion is a chat request in raw mode, its prompt taken as given and its reply passed through unparsed.
   * tools are accepted in either shape (`{"type":"function","function":{...}}` or Anthropic's `{name, description, input_schema}`)
   * tool search (Anthropic): a tool with `defer_loading: true` is left out of the template's tool list, and a `tool_reference` block in a
@@ -71,6 +74,8 @@ The launch file (`--config`), `--set key=value`, `ENGINE_*` environment variable
     (Claude Code's ToolSearch) does not change the prompt before it and the prefix cache still holds. The model can call a deferred tool
     either way. A reference to a tool missing from `tools`, or a request whose tools are all deferred, is refused as the API refuses it
   * images arrive as base64 `data:` URLs (OpenAI `image_url`) or `image` blocks (Anthropic), also inside `tool_result` blocks. Remote URLs are not fetched.
+  * videos arrive as OpenAI `video_url` parts (a video file's base64 `data:` URL) or `video` parts (`"video"`: the file's `data:` URL or an
+    array of its frames' image `data:` URLs, with `"timestamps"` in seconds or an `"fps"`, default 2); Anthropic's messages have no video block
   * `tool_choice` `required` / a named function tells the model to call a tool (best effort, no constrained decoding)
 * usage reports the prefix cache hits: OpenAI `prompt_tokens_details.cached_tokens`, Anthropic `cache_read_input_tokens` (with `input_tokens` excluding them)
   * a streamed Anthropic response sends its headers at once and `message_start` when the request takes its slot, so that usage already

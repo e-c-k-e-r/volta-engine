@@ -146,6 +146,8 @@ set(ENGINE_HOST_SOURCES
 	src/loader/deepseek_encoding.cpp
 	src/loader/jinja.cpp
 	src/loader/image.cpp
+	src/loader/video.cpp
+	src/loader/video_decode.cpp
 	src/loader/ngram_table.cpp
 	src/models/model.cpp
 	src/models/config_check.cpp
@@ -212,6 +214,23 @@ if(propan2ol_FOUND)
 	list(APPEND ENGINE_TTS_SOURCES src/tts/g2p.cpp src/tts/tts.cpp src/server/tts_service.cpp src/server/tts_page.cpp)
 else()
 	message(STATUS "propan2ol not found: vall-e TTS without its text front-end, pipeline and speech endpoint")
+endif()
+
+# Video files as model input (src/loader/video_decode.cpp): FFmpeg's libavformat, libavcodec and libswscale where pkg-config finds them;
+# without them a video arrives as its frames
+option(ENGINE_FFMPEG "decode video input with FFmpeg's libraries when found" ON)
+set(ENGINE_FFMPEG_FOUND OFF)
+if(ENGINE_FFMPEG)
+	find_package(PkgConfig QUIET)
+	if(PKG_CONFIG_FOUND)
+		pkg_check_modules(FFMPEG IMPORTED_TARGET libavformat libavcodec libavutil libswscale)
+	endif()
+	if(FFMPEG_FOUND)
+		set(ENGINE_FFMPEG_FOUND ON)
+		set_source_files_properties(${PROJECT_SOURCE_DIR}/src/loader/video_decode.cpp src/loader/video_decode.cpp PROPERTIES COMPILE_DEFINITIONS ENGINE_FFMPEG=1)
+	else()
+		message(STATUS "FFmpeg's libraries not found: video input as frames only")
+	endif()
 endif()
 
 if(ENGINE_GPU)
@@ -379,6 +398,9 @@ add_library(engine_kernels STATIC
 	${ENGINE_CORE_SOURCES}
 	${TRELLIS_SOURCES}
 )
+if(ENGINE_FFMPEG_FOUND)
+	target_link_libraries(engine_kernels PUBLIC PkgConfig::FFMPEG)
+endif()
 if(ENGINE_TTS)
 	target_link_libraries(engine_kernels PUBLIC propan2ol::propan2ol)
 	target_compile_definitions(engine_kernels PUBLIC ENGINE_TTS=1)
@@ -543,6 +565,10 @@ add_executable(test_image tests/2_parity/test_image.cpp)
 target_link_libraries(test_image PRIVATE engine_kernels)
 target_compile_definitions(test_image PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
 set_target_properties(test_image PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+add_executable(test_video tests/2_parity/test_video.cpp)
+target_link_libraries(test_video PRIVATE engine_kernels)
+target_compile_definitions(test_video PRIVATE TEST_DATA_DIR="${PROJECT_SOURCE_DIR}/tests/data")
+set_target_properties(test_video PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(test_trellis_order tests/2_parity/test_trellis_order.cpp)
 target_link_libraries(test_trellis_order PRIVATE engine_kernels)

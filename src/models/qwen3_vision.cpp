@@ -44,6 +44,7 @@ bool qwen3_vision_config( const char* model_dir, int max_patches, Qwen3VisionCon
 	params.merge_size = cfg.merge_size;
 	params.temporal_patch_size = cfg.temporal_patch_size;
 	params.max_pixels = max_patches * cfg.patch_size * cfg.patch_size;
+	engine::loader::read_video_params( model_dir, &params );
 	*out_cfg = cfg;
 	*out_params = params;
 	return true;
