@@ -25,7 +25,7 @@ struct PLE {
 		const backend::half_t* normed, const backend::half_t* conv_w, const backend::half_t* ring, const pod::BatchRows* d_rows,
 		const float* gated, float* streams, int rows, int channels, int dilation, backend::stream_t stream );
 
-	// ring[slot][pos % RING] = normed[row], for every row
+	// ring[slot][pos % RING] = normed[row], for every row (of rows taking one entry, the last)
 	static void ring_update( const backend::half_t* normed, backend::half_t* ring, const pod::BatchRows* d_rows, int rows, int channels, backend::stream_t stream );
 };
 

@@ -250,6 +250,18 @@ void test_ple() {
 	emit( "ple_conv_streams", dlf( streams, static_cast<size_t>( R ) * C ) );
 	PLE::ring_update( normed, ring, drows, R, C, nullptr );
 	emit( "ple_ring_slot0", dl( ring + 20 * static_cast<size_t>( C ), 4 * static_cast<size_t>( C ) ) );
+
+	// a chunk longer than the ring: slot 0's rows at 100..139 share entries (each keeps its last row), slot 1's at 5..7 after them
+	const int R2 = 43;
+	std::vector<int> slots2( R2 ), pos2( R2 );
+	for ( int r = 0; r < R2; ++r ) {
+		slots2[r] = r < 40 ? 0 : 1;
+		pos2[r] = r < 40 ? 100 + r : r - 35;
+	}
+	pod::BatchRows* drows2 = up_rows( pod::BatchRows::batched( R2, slots2.data(), pos2.data() ) );
+	half_t* normed2 = up( rh( rng, static_cast<size_t>( R2 ) * C, 1.0f ) );
+	PLE::ring_update( normed2, ring, drows2, R2, C, nullptr );
+	emit( "ple_ring_wrap", dl( ring, static_cast<size_t>( SLOTS ) * PLE::RING * C ) );
 }
 
 // ---- QSA indexer ----

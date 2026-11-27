@@ -139,7 +139,8 @@ Vulkan devices (`ENGINE_TP=4 build_vk/test_vulkan_forward --check <dir> --steps 
 weights round apart by design (llama.cpp's CPU kernels quantize the activations to q8_K, its CUDA ones to q8_1, the Vulkan shaders not at all) and take
 `--cos 0.999`; the K8V4 and NVFP4 caches also amplify rounding differences between tensor-parallel layouts. `--ids <int32 file>` sets the prompt (Gemma 4 needs a
 chat-formatted one) and `--image <dir>` places precomputed image embeddings, so a reference from outside the engine can serve as the golden (Gemma 4: exllamav3's
-full forward for EXL3, llama.cpp's own run for the QAT Q4_0 GGUF).
+full forward for EXL3, llama.cpp's own run for the QAT Q4_0 GGUF). `--repeat N` runs the prefill N more times on the reset slot and compares each run's logits with the
+first bit for bit, printing a hash of each (a backend's run-to-run determinism; processes compare by the hashes).
 
 ## MiniMax-H3: checkpoints and goldens
 

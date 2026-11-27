@@ -12,7 +12,7 @@ namespace vki = ::engine::backend::impl;
 // Device address of the slot index for row `slot.row + m` (BatchRows lives in device memory); without a BatchRows, a zeroed int (slot 0)
 uint64_t slot_index_addr( const pod::SlotRef& slot, int m, backend::stream_t stream ) {
 	if ( slot.rows != nullptr ) return vki::rows_slot( slot.rows ) + static_cast<uint64_t>( slot.row + m ) * sizeof( int );
-	void* zero = vki::scratch( 8, sizeof( int ), stream );
+	void* zero = vki::scratch( 7, sizeof( int ), stream );   // its own slot (8 is the host MoE path's routes)
 	backend::memset_async( zero, 0, sizeof( int ), stream );
 	return vki::dp( zero );
 }

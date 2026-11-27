@@ -93,10 +93,15 @@ __global__ void ple_conv_kernel(
 	streams[o] += gated[o] + act;
 }
 
-__global__ void ple_ring_kernel( const half* __restrict__ normed, half* __restrict__ ring, const pod::BatchRows* __restrict__ rows, int channels ) {
+// A row whose ring entry a later row of the same slot also takes writes nothing, so the entry holds its last position whatever order the
+// blocks run in
+__global__ void ple_ring_kernel( const half* __restrict__ normed, half* __restrict__ ring, const pod::BatchRows* __restrict__ rows, int n_rows, int channels ) {
 	const int r = blockIdx.y;
 	const int c = blockIdx.x * blockDim.x + threadIdx.x;
-	if ( c >= channels ) return;
+	const int slot = rows->slot[r], e = rows->pos[r] % PLE::RING;
+	int later = 0;
+	for ( int q = r + 1 + threadIdx.x; q < n_rows; q += blockDim.x ) later |= rows->slot[q] == slot && rows->pos[q] % PLE::RING == e;
+	if ( __syncthreads_or( later ) || c >= channels ) return;
 	ring[( static_cast<size_t>( rows->slot[r] ) * PLE::RING + ( rows->pos[r] % PLE::RING ) ) * channels + c] = normed[static_cast<size_t>( r ) * channels + c];
 }
 
@@ -117,7 +122,7 @@ void PLE::conv_apply( const backend::half_t* normed, const backend::half_t* conv
 }
 
 void PLE::ring_update( const backend::half_t* normed, backend::half_t* ring, const pod::BatchRows* d_rows, int rows, int channels, backend::stream_t stream ) {
-	ple_ring_kernel<<<dim3( ( channels + 255 ) / 256, rows ), 256, 0, stream>>>( reinterpret_cast<const half*>( normed ), reinterpret_cast<half*>( ring ), d_rows, channels );
+	ple_ring_kernel<<<dim3( ( channels + 255 ) / 256, rows ), 256, 0, stream>>>( reinterpret_cast<const half*>( normed ), reinterpret_cast<half*>( ring ), d_rows, rows, channels );
 }
 
 } // namespace engine::modules

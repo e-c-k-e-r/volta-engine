@@ -9,8 +9,11 @@
 #include "engine/runtime/cluster.h"
 #include "engine/backend/numeric.h"
 #include "golden_io.h"
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <cstdlib>
@@ -28,6 +31,7 @@ int main( int argc, char** argv ) {
 	int ntokens = 4;
 	const char* ids_file = nullptr;
 	const char* image_dir = nullptr;   // --image <dir>: image.f32 ([count, hidden] embeddings) placed at the positions of image_at.txt ("start count")
+	int repeats = 0;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--model" ) ) model_dir = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--type" ) ) model_type = argv[i + 1];
@@ -36,9 +40,10 @@ int main( int argc, char** argv ) {
 		if ( !std::strcmp( argv[i], "--cos" ) ) min_cos = std::atof( argv[i + 1] );
 		if ( !std::strcmp( argv[i], "--ids" ) ) ids_file = argv[i + 1];
 		if ( !std::strcmp( argv[i], "--image" ) ) image_dir = argv[i + 1];
+		if ( !std::strcmp( argv[i], "--repeat" ) ) repeats = std::atoi( argv[i + 1] );
 	}
 	if ( !args.dump && !args.check ) {
-		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4> | --ids <int32 token ids file>] [--cos <logits bound, default 0.9999>]\n" );
+		std::printf( "usage: test_cpu_forward --dump|--check <dir> [--model <dir>] [--type <model_type>] [--steps <greedy decode steps after the prefill>] [--tokens <prompt length, default 4> | --ids <int32 token ids file>] [--cos <logits bound, default 0.9999>] [--repeat <n: the prefill again n times, bit for bit>]\n" );
 		return 2;
 	}
 	::setenv( "ENGINE_TP", "1", 0 );
@@ -107,7 +112,33 @@ int main( int argc, char** argv ) {
 		std::printf( "\n" );
 	}
 
+	// --repeat n: the same prefill n more times on the reset slot, each one's logits against the first run's bit for bit (a backend's run-to-run
+	// determinism without reloading the model)
 	bool ok = true;
+	auto hash = []( const std::vector<backend::half_t>& v ) {   // FNV-1a of the logits' bits: runs in other processes compare by it
+		uint64_t h = 1469598103934665603ull;
+		const auto* b = reinterpret_cast<const uint8_t*>( v.data() );
+		for ( size_t i = 0; i < v.size() * sizeof( backend::half_t ); ++i ) h = ( h ^ b[i] ) * 1099511628211ull;
+		return h;
+	};
+	if ( repeats > 0 ) std::printf( "  logits hash %016llx\n", static_cast<unsigned long long>( hash( logits_h ) ) );
+	for ( int rep = 0; rep < repeats; ++rep ) {
+		mc.reset_slot( 0 );
+		mc.prefill( prompt.data(), static_cast<int>( prompt.size() ), 0, 0 );
+		std::vector<backend::half_t> again( logits_h.size() );
+		mc.read_logits( 1, again.data() );
+		size_t diff = 0;
+		float worst = 0.0f;
+		for ( size_t i = 0; i < again.size(); ++i ) {
+			if ( std::memcmp( &again[i], &logits_h[i], sizeof( backend::half_t ) ) != 0 ) {
+				++diff;
+				worst = std::max( worst, std::fabs( backend::to_float( again[i] ) - logits[i] ) );
+			}
+		}
+		std::printf( "  repeat %d (hash %016llx): %s", rep + 1, static_cast<unsigned long long>( hash( again ) ), diff == 0 ? "logits identical\n" : "" );
+		if ( diff ) std::printf( "%zu logits differ (max |d| %g)\n", diff, worst );
+		ok = ok && diff == 0;
+	}
 	if ( args.dump ) {
 		ok = golden_write( args.dir, "forward_logits", logits.data(), logits.size() * sizeof( float ) )
 			&& golden_write( args.dir, "forward_pred", &pred, sizeof( pred ) )

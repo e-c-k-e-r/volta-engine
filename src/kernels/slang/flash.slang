@@ -340,14 +340,27 @@ void ple_conv(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform PleC
 	p.streams[o] += p.gated[o] + acc / (1.0f + exp(-acc));
 }
 
-struct PleRingParams { half* normed; half* ring; int* slots; int* pos; int channels; };
+struct PleRingParams { half* normed; half* ring; int* slots; int* pos; int channels; int rows; };
 
+groupshared int s_ple_later;
+
+// Group per (channel tile, row); a row whose ring entry a later row of the same slot also takes writes nothing, so the entry holds its last
+// position whatever order the groups run in
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void ple_ring(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform PleRingParams p) {
-	let c = int(gid.x) * 256 + int(tid.x);
+	let t = int(tid.x);
+	let c = int(gid.x) * 256 + t;
 	let r = int(gid.y);
-	if (c >= p.channels) return;
+	let slot = p.slots[r];
+	let e = p.pos[r] % PLE_RING;
+	if (t == 0) s_ple_later = 0;
+	GroupMemoryBarrierWithGroupSync();
+	for (int q = r + 1 + t; q < p.rows; q += 256) {
+		if (p.slots[q] == slot && p.pos[q] % PLE_RING == e) s_ple_later = 1;
+	}
+	GroupMemoryBarrierWithGroupSync();
+	if (s_ple_later != 0 || c >= p.channels) return;
 	p.ring[(int64_t(p.slots[r]) * PLE_RING + (p.pos[r] % PLE_RING)) * p.channels + c] = p.normed[int64_t(r) * p.channels + c];
 }
 

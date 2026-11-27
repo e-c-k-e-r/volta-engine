@@ -142,7 +142,7 @@ void PLE::conv_apply( const backend::half_t* normed, const backend::half_t* conv
 }
 
 void PLE::ring_update( const backend::half_t* normed, backend::half_t* ring, const pod::BatchRows* d_rows, int rows, int channels, backend::stream_t stream ) {
-	vki::PleRingParams p{ vki::dp( normed ), vki::dp( ring ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ), channels };
+	vki::PleRingParams p{ vki::dp( normed ), vki::dp( ring ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ), channels, rows };
 	vki::launch( "ple_ring", p, stream, tiles( channels, 256 ), rows );
 }
 

@@ -211,6 +211,11 @@ private:
 	int replay_next_[256] = {};   // per layer (routes) and 128 + attention layer (QSA): the next record
 	void dump_train_input( int kind, const void* a, int m, int cols_a, const void* b, int cols_b, backend::stream_t stream );
 	void trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols = 0 );
+	// trace_device: the records copied into a device buffer as the forward runs, written out after its last layer
+	struct TraceRec { int tag, rows, m; size_t off, row_bytes; bool f32; };
+	void* trace_dev_ = nullptr;
+	size_t trace_used_ = 0;
+	std::vector<TraceRec> trace_recs_;
 	// Calibration (hessian_dir): x^T x of a projection input, accumulated over prefill rows into site `site` of layer `layer`
 	// (0 attention / GDN input, 1 MoE input, 2 o_proj / out_proj input (rank slice), 3 shared-expert down input, 4 lm_head input with layer 0)
 	void hessian( int layer, int site, const void* x, int k, int m, backend::stream_t stream );

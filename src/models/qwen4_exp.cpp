@@ -170,6 +170,7 @@ Qwen4ExpPipeline::~Qwen4ExpPipeline() {
 		graphs_.reset();
 		if ( side_stream_ != nullptr ) backend::stream_destroy( side_stream_ );
 		if ( side_stream2_ != nullptr ) backend::stream_destroy( side_stream2_ );
+		if ( trace_dev_ != nullptr ) backend::device_free( trace_dev_ );
 		tier_.stream_wait();
 		engine::core::arena_destroy( host_arena_ );
 	}
@@ -924,10 +925,43 @@ void Qwen4ExpPipeline::forward( const pod::BatchRows& rows, backend::stream_t st
 
 void Qwen4ExpPipeline::trace_rows( int tag, const void* dev, bool streams, int m, backend::stream_t stream, int cols ) {
 	static const std::string& path = runtime::options().trace_layers;
-	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	static const bool on_device = runtime::options().trace_device;
+	if ( path.empty() || ( rank_ != 0 && !on_device ) || m <= pod::MAX_BATCH ) return;
 	if ( streams ) flush_apply( m, stream );
 	const int H = config_.hidden_size;
 	if ( cols <= 0 ) cols = H;
+	if ( on_device ) {
+		// every row of the first four layers' records (and of the PLE layer's and the final ones), the last row of the others; copied on the stream,
+		// nothing synchronized until the forward's last record
+		constexpr size_t kTraceBytes = size_t( 1536 ) << 20;
+		if ( trace_dev_ == nullptr ) trace_dev_ = backend::device_malloc( kTraceBytes );
+		const int layer = tag < 700 ? tag % 100 : -1;
+		const int rows = ( layer >= 0 && layer < 4 ) || tag >= 700 ? m : 1;
+		const size_t row_bytes = streams ? static_cast<size_t>( config_.hc_mult ) * H * sizeof( float ) : static_cast<size_t>( cols ) * sizeof( backend::half_t );
+		const size_t bytes = rows * row_bytes;
+		if ( trace_used_ + bytes <= kTraceBytes ) {
+			backend::memcpy_async( static_cast<char*>( trace_dev_ ) + trace_used_, static_cast<const char*>( dev ) + ( m - rows ) * row_bytes, bytes, backend::Copy::D2D, stream );
+			trace_recs_.push_back( { tag, rows, m, trace_used_, row_bytes, streams } );
+			trace_used_ += bytes;
+		}
+		if ( tag != 600 + config_.num_layers - 1 ) return;   // the forward's last record
+		backend::stream_sync( stream );
+		std::vector<char> host( trace_used_ );
+		backend::memcpy_async( host.data(), trace_dev_, trace_used_, backend::Copy::D2H, stream );
+		backend::stream_sync( stream );
+		const std::string file = rank_ == 0 ? path : path + ".r" + std::to_string( rank_ );
+		if ( FILE* f = std::fopen( file.c_str(), "ab" ) ) {
+			for ( const TraceRec& r : trace_recs_ ) {
+				const int hdr[5] = { r.tag, r.rows, r.m, r.f32 ? 1 : 0, static_cast<int>( r.row_bytes ) };
+				std::fwrite( hdr, sizeof( int ), 5, f );
+				std::fwrite( host.data() + r.off, 1, r.rows * r.row_bytes, f );
+			}
+			std::fclose( f );
+		}
+		trace_recs_.clear();
+		trace_used_ = 0;
+		return;
+	}
 	const size_t elems = static_cast<size_t>( m ) * ( streams ? config_.hc_mult * H : cols );
 	std::vector<float> out( elems );
 	backend::stream_sync( stream );
@@ -1178,7 +1212,7 @@ void Qwen4ExpPipeline::replay_qsa( int attn_idx, int m, backend::stream_t stream
 
 void Qwen4ExpPipeline::trace_route( int tag, int m, backend::stream_t stream ) {
 	static const std::string& path = runtime::options().trace_layers;
-	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH ) return;
+	if ( path.empty() || rank_ != 0 || m <= pod::MAX_BATCH || runtime::options().trace_device ) return;
 	const int K = config_.top_k;
 	std::vector<int> ids( static_cast<size_t>( m ) * K );
 	std::vector<backend::half_t> w( ids.size() );

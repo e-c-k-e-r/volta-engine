@@ -147,7 +147,7 @@ struct GrGateActParams { uint64_t z, t_hi, t_lo, post; int ld, rank, hc, has_inj
 struct GrUpEpilogueParams { uint64_t u, normed, mixed; int hidden, hc; };
 struct PleGateParams { uint64_t key, value, streams, wk, wq, wc, gated, normed; int hidden, hc; float eps, gate_scale; };
 struct PleConvParams { uint64_t normed, conv_w, ring, slots, pos, gated, streams; int channels, dilation; };
-struct PleRingParams { uint64_t normed, ring, slots, pos; int channels; };
+struct PleRingParams { uint64_t normed, ring, slots, pos; int channels, rows; };
 struct QsaPrepParams { uint64_t qk, qw, q_out, ring, slots, pos; int layer; int64_t ring_slot_stride; int rot_dim; float theta, eps; };
 struct QsaPoolParams { uint64_t ring, pool_plane, kw, slots, pos; int layer; int64_t ring_slot_stride, pool_slot_stride; int max_pools, rot_dim; float theta, eps; };
 struct QsaScoreParams { uint64_t q, pool_plane, scores, slots, pos; int score_stride, layer, max_pools; int64_t pool_slot_stride; float scale; };
