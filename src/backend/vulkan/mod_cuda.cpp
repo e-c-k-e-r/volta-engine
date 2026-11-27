@@ -1,7 +1,8 @@
-// Vulkan backend: the tensor-core path of NVIDIA GPUs without cooperative matrices (Volta). The FP16 GEMMs run the CUDA backend's kernels
-// (src/kernels/cuda/gemm/gemm_f16_kernel.cuh; the PTX entry points of gemm_f16_vk.cu, <kernel dir>/cuda_gemm.ptx) launched from the command
-// buffers through VK_NV_cuda_kernel_launch, with gemm_f16.cu's tiles by row count and its split along k. Devices with cooperative matrices
-// would take shaders of their own beside this (tensor_path); the others keep the shader-core matmuls.
+// Vulkan backend: the tensor-core path of NVIDIA GPUs without cooperative matrices (Volta). The FP16 GEMMs and the NVFP4 linears up to
+// mid-size chunks run the CUDA backend's kernels (src/kernels/cuda/gemm/gemm_f16_kernel.cuh, src/kernels/cuda/nvfp4/nvfp4_linear_kernels.cuh;
+// the PTX entry points of gemm_f16_vk.cu and nvfp4_vk.cu, <kernel dir>/cuda_gemm.ptx and cuda_nvfp4.ptx) launched from the command buffers
+// through VK_NV_cuda_kernel_launch, with gemm_f16.cu's tiles by row count and its split along k and skinny_kernels.cu's kernel by row count.
+// Devices with cooperative matrices would take shaders of their own beside this (tensor_path); the others keep the shader-core kernels.
 #include "mod_common.h"
 #include <algorithm>
 #include <cstdlib>
@@ -32,9 +33,9 @@ constexpr TileCfg kTileCfg[4] = {
 constexpr double kSmRate = 70.0, kLone = 1.17, kShared = 1.56, kPartBandwidth = 700.0;
 constexpr size_t kSplitFloats = size_t( 16 ) << 20;
 
-vk::CudaFunction* function( const char* name ) {
+vk::CudaFunction* function( const char* name, const char* module = "cuda_gemm" ) {
 	const char* dir = std::getenv( "ENGINE_SPV_DIR" );
-	const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/cuda_gemm.ptx";
+	const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/" + module + ".ptx";
 	return vk::cuda_function( path.c_str(), name );
 }
 
@@ -64,8 +65,10 @@ int model_splits( const TileCfg& t, int m, int n, int k ) {
 
 } // namespace
 
-bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, int k_split, stream_t stream ) {
+bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, int k_split, stream_t stream, int ldc ) {
 	if ( tensor_path() != TensorPath::CudaLaunch || m <= 0 || n <= 0 || k <= 0 || k % 8 != 0 ) return false;
+	if ( ldc <= 0 ) ldc = n;
+	if ( k_split > 0 && k_split < k && ldc != n ) return false;   // the caller's slab partials are m x n planes
 	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
 	if ( !aligned( w ) || !aligned( x ) ) return false;
 	// gemm_f16.cu's tile by row count
@@ -97,7 +100,7 @@ bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k,
 	const void* a = x;
 	const void* wp = w;
 	void* o = out;
-	int lda = k, ldw = k, ldc = n, mm = m, nn = n, kk = k;
+	int lda = k, ldw = k, mm = m, nn = n, kk = k;
 	float beta = 0.0f;
 	const void* params[12] = { &a, &lda, &wp, &ldw, &o, &ldc, &mm, &nn, &kk, &beta, &part, &k_per_split };
 	const uint32_t smem = static_cast<uint32_t>( 2 * ( t.bm * t.bk + t.bn * t.bk ) * 2 );
@@ -110,6 +113,42 @@ bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k,
 		const int quads = m * ( ( n + 3 ) / 4 );
 		vk::cuda_launch( stream, reduce, static_cast<uint32_t>( ( quads + 255 ) / 256 ), 1, 1, 256, 1, 1, 0, rparams, 7 );
 	}
+	return true;
+}
+
+bool cuda_nvfp4_linear( const void* codes, const void* scales, const void* x, void* out, int m, int n, int k, float gscale, stream_t stream ) {
+	if ( tensor_path() != TensorPath::CudaLaunch || m <= 0 || k % 64 != 0 || n % 32 != 0 ) return false;
+	// skinny_kernels.cu's choice: the split-K skinny kernels up to 16 rows (9 to 16 split only where the output is narrow), the 3 and 4
+	// row-tile ones up to 32, the fused GEMM below 384 rows where its tiles fill the GPU; larger chunks dequantize for the FP16 GEMM
+	const int g = k / 16;
+	const char* name = nullptr;
+	uint32_t threads = 128, gx = static_cast<uint32_t>( n / 32 ), gy = 1;
+	if ( m <= 8 ) {
+		if ( g % 16 == 0 ) name = "vk_nvfp4_qpn2_16_2_1", threads = 512;
+		else if ( g % 8 == 0 ) name = "vk_nvfp4_qpn2_8_2_1", threads = 256;
+		else name = "vk_nvfp4_qpn_1";
+	}
+	else if ( m <= 16 ) {
+		const bool split = n <= 8192;
+		if ( split && g % 16 == 0 ) name = "vk_nvfp4_qpn2_16_2_2", threads = 512;
+		else if ( split && g % 8 == 0 ) name = "vk_nvfp4_qpn2_8_2_2", threads = 256;
+		else name = "vk_nvfp4_qpn_2";
+	}
+	else if ( m <= 32 ) name = m <= 24 ? "vk_nvfp4_qpn_3" : "vk_nvfp4_qpn_4";
+	else if ( m < 384 && ( ( n + 127 ) / 128 ) * ( ( m + 127 ) / 128 ) >= 48 ) {
+		name = "vk_nvfp4_gemm_tc", threads = 256;
+		gx = static_cast<uint32_t>( ( n + 127 ) / 128 );
+		gy = static_cast<uint32_t>( ( m + 127 ) / 128 );
+	}
+	else return false;
+	vk::CudaFunction* fn = function( name, "cuda_nvfp4" );
+	if ( fn == nullptr ) return false;
+	const void* c = codes;
+	const void* sc = scales;
+	const void* xp = x;
+	void* y = out;
+	const void* params[8] = { &c, &sc, &xp, &y, &n, &k, &m, &gscale };
+	vk::cuda_launch( stream, fn, gx, gy, 1, threads, 1, 1, 0, params, 8 );
 	return true;
 }
 

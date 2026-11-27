@@ -304,19 +304,27 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	else()
 		message(STATUS "glslc not found: the Vulkan GGUF projections run on the Slang kernels alone")
 	endif()
-	# The CUDA backend's FP16 tensor-core GEMM as PTX for the launches through VK_NV_cuda_kernel_launch (NVIDIA GPUs without cooperative
-	# matrices: Volta; src/backend/vulkan/mod_cuda.cpp), where nvcc is found
+	# The CUDA backend's FP16 tensor-core GEMM and NVFP4 linear kernels as PTX for the launches through VK_NV_cuda_kernel_launch (NVIDIA GPUs
+	# without cooperative matrices: Volta; src/backend/vulkan/mod_cuda.cpp), where nvcc is found
 	find_program(ENGINE_NVCC nvcc HINTS /opt/cuda/bin /usr/local/cuda/bin ENV CUDA_PATH PATH_SUFFIXES bin)
 	if(ENGINE_NVCC)
-		set(sout ${SLANG_OUT}/cuda_gemm.ptx)
-		add_custom_command(OUTPUT ${sout}
-			COMMAND ${ENGINE_NVCC} -arch=compute_70 -ptx -std=c++17 -O3 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 177
-				${PROJECT_SOURCE_DIR}/src/kernels/cuda/gemm/gemm_f16_vk.cu -o ${sout}
-			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/cuda/gemm/gemm_f16_vk.cu ${PROJECT_SOURCE_DIR}/src/kernels/cuda/gemm/gemm_f16_kernel.cuh
-			COMMENT "nvcc gemm_f16_vk -> ptx")
-		list(APPEND VK_FLASH_SPV ${sout})
+		set(KDIR ${PROJECT_SOURCE_DIR}/src/kernels/cuda)
+		foreach(ptx "cuda_gemm|gemm/gemm_f16_vk.cu|gemm/gemm_f16_kernel.cuh" "cuda_nvfp4|nvfp4/nvfp4_vk.cu|nvfp4/nvfp4_linear_kernels.cuh;nvfp4/nvfp4_common.cuh;nvfp4/nvfp4_frag.h;mma_sm80.cuh;mma_frag.h")
+			string(REPLACE "|" ";" parts "${ptx}")
+			list(GET parts 0 name)
+			list(GET parts 1 src)
+			list(SUBLIST parts 2 -1 deps)
+			list(TRANSFORM deps PREPEND ${KDIR}/)
+			set(sout ${SLANG_OUT}/${name}.ptx)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${ENGINE_NVCC} -arch=compute_70 -ptx -std=c++17 -O3 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 177
+					${KDIR}/${src} -o ${sout}
+				DEPENDS ${KDIR}/${src} ${deps}
+				COMMENT "nvcc ${src} -> ptx")
+			list(APPEND VK_FLASH_SPV ${sout})
+		endforeach()
 	else()
-		message(STATUS "nvcc not found: on NVIDIA GPUs without cooperative matrices the Vulkan GEMMs stay on the shader cores")
+		message(STATUS "nvcc not found: on NVIDIA GPUs without cooperative matrices the Vulkan GEMMs and NVFP4 linears stay on the shader cores")
 	endif()
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
 	add_dependencies(slang_kernels flash_spv)

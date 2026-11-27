@@ -61,7 +61,7 @@ auto engine = volta::Engine::create( config_json, &error );   // or ( config_jso
   its own where the GPU supports it: `bufferDeviceAddress`, `shaderFloat16`, `timelineSemaphore`, `shaderInt64`, `shaderInt16`,
   `shaderFloat64`, `shaderInt8`, 16- and 8-bit storage, and `subgroupSizeControl` on GPUs whose subgroups are not 32 wide. The engine uses
   `VK_KHR_push_descriptor`, `VK_EXT_external_memory_host`, `VK_EXT_memory_budget`, `VK_KHR_shader_integer_dot_product`,
-  `VK_EXT_subgroup_size_control` and `VK_NV_cuda_kernel_launch` (with its `cudaKernelLaunchFeatures`: the tensor-core GEMM on Volta) when they
+  `VK_EXT_subgroup_size_control` and `VK_NV_cuda_kernel_launch` (with its `cudaKernelLaunchFeatures`: the tensor-core GEMM and NVFP4 kernels on Volta) when they
   are enabled. A device that lacks a required feature is refused with an error naming it. The
   host's device is the only one: `tp_size` 1 and `tts.device` 0.
 

@@ -824,13 +824,20 @@ void gguf_gemm_tile(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, unifor
 // out[e] = value e of the blocks, a thread per value
 struct GgufDequantParams { uint* w; uint* tables; half* out_; int64_t elems; int type; };
 
+// A thread per 8 consecutive values (elems a multiple of 8: every block holds a multiple of 8, so they share a block), one 16-byte store
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void gguf_dequant(uint3 gid : SV_DispatchThreadID, uniform GgufDequantParams p) {
-	let e = int64_t(gid.x) + int64_t(gid.y) * 65535 * 256;
+	let e = (int64_t(gid.x) + int64_t(gid.y) * 65535 * 256) * 8;
 	if (e >= p.elems) return;
 	let be = block_elems(p.type);
-	p.out_[e] = half(dq(p.type, p.w, (e / be) * block_bytes(p.type), int(e % be), p.tables));
+	let at = (e / be) * block_bytes(p.type);
+	let i0 = int(e % be);
+	half v[8];
+	[ForceUnroll]
+	for (int i = 0; i < 8; ++i) v[i] = half(dq(p.type, p.w, at, i0 + i, p.tables));
+	storeAligned<16>((uint4*)(p.out_ + e), uint4(bit_cast<uint>(half2(v[0], v[1])), bit_cast<uint>(half2(v[2], v[3])), bit_cast<uint>(half2(v[4], v[5])),
+		bit_cast<uint>(half2(v[6], v[7]))));
 }
 
 // out[r][i] = x[r][src(i)]: the activation rows in the weight's tiled column order, for kernels that read them as they are

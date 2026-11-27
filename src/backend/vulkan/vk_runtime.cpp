@@ -533,7 +533,11 @@ bool create_buffer( size_t bytes, bool host, VkBuffer& buf, VkDeviceMemory& mem,
 	vkGetBufferMemoryRequirements( cur().device, buf, &req );
 	const uint32_t type = find_memory( req.memoryTypeBits, host ? ( VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT ) : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
 	if ( type == UINT32_MAX ) { vkDestroyBuffer( cur().device, buf, nullptr ); return false; }
-	VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+	// device buffers as dedicated allocations: NVIDIA's driver maps those with large pages, the others take about twice as long in kernels
+	// whose reads stride far apart (a GEMM over long rows), like an address-translation miss per access
+	VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
+	dedicated.buffer = buf;
+	VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &dedicated };
 	flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 	VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, host ? nullptr : &flags };
 	mai.allocationSize = req.size;

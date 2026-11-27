@@ -39,8 +39,12 @@ enum class TensorPath { None, CudaLaunch };
 TensorPath tensor_path();
 // out [m, n] = x [m, k] times the FP16 weights w [n, k] on the CUDA backend's tensor-core GEMM (mod_cuda.cpp), FP16 or (f32_out) FP32 out.
 // k_split > 0: the K range in slabs of k_split, slab s's FP32 partial into out + s * m * n; else split as the GEMM's model decides, the partials
-// summed into out. False where it does not run (no CUDA launches, k not a multiple of 8, w or x not 16-byte aligned)
-bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, int k_split, stream_t stream );
+// summed into out. ldc: out's row stride (0: n; a slice of a wider output). False where it does not run (no CUDA launches, k not a multiple
+// of 8, w or x not 16-byte aligned)
+bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, int k_split, stream_t stream, int ldc = 0 );
+// The NVFP4 W4A16 linear out[m, n] = x[m, k] W^T on the CUDA backend's kernels (the prepacked codes and scales, the global scale as stored),
+// false where the tensor path is not CudaLaunch or the rows are a chunk for the dequantization and the FP16 GEMM
+bool cuda_nvfp4_linear( const void* codes, const void* scales, const void* x, void* out, int m, int n, int k, float gscale, stream_t stream );
 // FP32: d [n rows of stride_d][m] = a [m, k] times b [n, k]^T (d[j * stride_d + i] = a row i . b row j), on llama.cpp's matmul; false where it
 // does not apply (no bound pipelines, operands not 16-byte aligned)
 bool ggml_f32_matmul( const void* a, const void* b, void* d, int m, int n, int k, int stride_d, stream_t stream );

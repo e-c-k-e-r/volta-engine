@@ -290,8 +290,9 @@ void LinearGguf::prepare() {
 
 void LinearGguf::dequant( const void* w, GgmlType type, int64_t elems, backend::half_t* out, backend::stream_t stream ) {
 	ENGINE_ASSERT( gguf_linear_supported( type ), "LinearGguf::dequant (Vulkan): unsupported block type" );
+	ENGINE_ASSERT( elems % 8 == 0 && reinterpret_cast<uintptr_t>( out ) % 16 == 0, "LinearGguf::dequant (Vulkan): whole runs of 8 values, 16-byte aligned" );
 	GgufDequantParams p{ vki::dp( w ), vki::dp( tables() ), vki::dp( out ), elems, static_cast<int>( type ) };
-	const int64_t groups = ( elems + 255 ) / 256;
+	const int64_t groups = ( elems / 8 + 255 ) / 256;   // a thread per 8 values
 	vki::launch( "gguf_dequant", p, stream, static_cast<uint32_t>( std::min<int64_t>( groups, 65535 ) ), static_cast<uint32_t>( ( groups + 65534 ) / 65535 ) );
 }
 
@@ -307,6 +308,30 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	// subgroup per column); more llama.cpp's int8 matmul (the types that have one) or its dequantizing matmul (the lookup-table types);
 	// otherwise the Slang kernels: up to 8 rows a subgroup per column with FP16 activations, more a workgroup per 64 x 64 tile
 	backend::vk::Pipeline* mmv = m <= kMmvMaxRows ? mmv_pipeline( type, m ) : nullptr;
+	// More than 16 rows on the tensor cores where the device launches CUDA kernels (the CUDA backend's prefill form): the weight dequantized to
+	// FP16 in slices of output rows (at most kReconBytes each), each slice's GEMM writing its columns of the output, column-tiled activations
+	// permuted first. A first slice the GEMM refuses (no CUDA module) leaves the matmuls below
+	if ( m > kDotMaxRows && vki::tensor_path() == vki::TensorPath::CudaLaunch ) {
+		constexpr size_t kReconBytes = size_t( 64 ) << 20;
+		const size_t rb = row_bytes( type, k );
+		const int nc = std::min( n, std::max( 128, static_cast<int>( kReconBytes / ( static_cast<size_t>( k ) * sizeof( backend::half_t ) ) ) / 128 * 128 ) );
+		const void* xs = x.data;
+		if ( tiling.heads != 0 ) {
+			void* xp = vki::scratch( 19, static_cast<size_t>( m ) * k * sizeof( backend::half_t ), stream );
+			GgufPermuteParams q{ vki::dp( x.data ), vki::dp( xp ), m, k, tiling.heads, tiling.dim };
+			vki::launch( "gguf_permute_rows", q, stream, static_cast<uint32_t>( ( k + 255 ) / 256 ), static_cast<uint32_t>( m ) );
+			xs = xp;
+		}
+		auto* wf = static_cast<backend::half_t*>( vki::scratch( 43, static_cast<size_t>( nc ) * k * sizeof( backend::half_t ), stream ) );
+		bool ok = true;
+		for ( int n0 = 0; n0 < n && ok; n0 += nc ) {
+			const int c = std::min( nc, n - n0 );
+			dequant( static_cast<const uint8_t*>( w ) + static_cast<size_t>( n0 ) * rb, type, static_cast<int64_t>( c ) * k, wf, stream );
+			ok = vki::cuda_gemm_tn( wf, xs, out.ptr<backend::half_t>() + n0, m, c, k, false, 0, stream, n );
+			ENGINE_ASSERT( ok || n0 == 0, "LinearGguf::forward (Vulkan): the tensor-core GEMM refused a later slice" );
+		}
+		if ( ok ) return;
+	}
 	// more than 16 rows: llama.cpp's matmuls, the large tiles from 128 rows
 	const bool large = false;   // the 64 x 64 tiles, as ggml_f16_matmul's (the 128 x 128 ones measured slower on the V100 at prefill chunks too)
 	backend::vk::Pipeline* mmq = m > kDotMaxRows && k % 128 == 0 ? mmq_pipeline( type, large ) : nullptr;

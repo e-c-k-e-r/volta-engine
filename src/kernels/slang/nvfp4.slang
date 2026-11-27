@@ -514,18 +514,25 @@ void nvfp4_gemv(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Nv
 	}
 }
 
-// ---- the weight decoded to FP16 W^T [n, k] for llama.cpp's matmul (more rows): a thread per (tile, group, lane), the lane's 16 weights of the
-// group as two 16-byte stores
+// ---- the weight decoded to FP16 W^T [n, k] for the FP16 matmul (more rows): a workgroup per (32-column tile, NVD_GROUPS groups), a thread
+// per (group, lane) decoding into shared memory, then each row's 16 NVD_GROUPS weights stored as one 128-byte run (a lane's 32-byte piece per
+// row scatters the stores over 32 rows, at about half the write bandwidth). K is a multiple of 64: whole runs.
+
+static const int NVD_GROUPS = 4;
+groupshared uint4 s_dq[32][NVD_GROUPS * 2 + 1];
 
 [shader("compute")]
-[numthreads(256, 1, 1)]
-void nvfp4_dequant(uint3 tid : SV_DispatchThreadID, uniform Nvfp4GemvParams p) {
+[numthreads(128, 1, 1)]
+void nvfp4_dequant(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Nvfp4GemvParams p) {
 	let G = p.k / 16;
-	let i = int64_t(tid.x) + int64_t(tid.y) * 65535 * 256;
-	if (i >= int64_t(p.n / 32) * G * 32) return;
-	let lane = int(i & 31);
-	let g = int((i >> 5) % G);
-	let tile = int((i >> 5) / G);
+	let runs = G / NVD_GROUPS;
+	let b = int(gid.x + gid.y * 65535u);
+	if (b >= (p.n / 32) * runs) return;
+	let tile = b / runs;
+	let g0 = (b - tile * runs) * NVD_GROUPS;
+	let t = int(tid.x);
+	let lane = t & 31;
+	let i = (int64_t(tile) * G + g0 + (t >> 5)) * 32 + lane;
 	let gm = half(p.gm);
 	let q = loadAligned<8>((uint2*)p.codes + i);
 	let s = half(e4m3_value(uint(p.scales[i]))) * gm;
@@ -541,7 +548,15 @@ void nvfp4_dequant(uint3 tid : SV_DispatchThreadID, uniform Nvfp4GemvParams p) {
 			wv[h * 4 + j] = bit_cast<uint>(bit_cast<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12)) * s2);
 		}
 	}
-	half* o = p.out_ + int64_t(tile * 32 + nv_lane_col(lane)) * p.k + g * 16;
-	storeAligned<16>((uint4*)o, uint4(wv[0], wv[1], wv[2], wv[3]));
-	storeAligned<16>((uint4*)(o + 8), uint4(wv[4], wv[5], wv[6], wv[7]));
+	let r = nv_lane_col(lane);
+	s_dq[r][(t >> 5) * 2] = uint4(wv[0], wv[1], wv[2], wv[3]);
+	s_dq[r][(t >> 5) * 2 + 1] = uint4(wv[4], wv[5], wv[6], wv[7]);
+	GroupMemoryBarrierWithGroupSync();
+	[ForceUnroll]
+	for (int u = 0; u < 2; ++u) {
+		let e = t + u * NVD_GROUPS * 32;
+		let row = e / (NVD_GROUPS * 2);
+		let c = e - row * (NVD_GROUPS * 2);
+		storeAligned<16>((uint4*)(p.out_ + int64_t(tile * 32 + row) * p.k + g0 * 16) + c, s_dq[row][c]);
+	}
 }

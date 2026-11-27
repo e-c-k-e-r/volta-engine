@@ -22,7 +22,8 @@ the tests are described in [TESTS.md](TESTS.md). `gate.sh sass` fingerprints eve
 
 | File | Kernels | Verified by |
 |---|---|---|
-| `skinny_kernels.cu`, `nvfp4_common.cuh`, `nvfp4_frag.h` | skinny (M <= 32) and fused-GEMM kernels with FP16-rounded dequant, plus the `LinearNVFP4` module entry (CPU has a mirrored implementation) | `test_nvfp4_linear`, `test_ops_linear`, `bench_nvfp4_shapes`, `test_mma_frag` |
+| `nvfp4_linear_kernels.cuh`, `skinny_kernels.cu`, `nvfp4_common.cuh`, `nvfp4_frag.h` | skinny (M <= 32) and fused-GEMM kernels with FP16-rounded dequant, the dequantization into FP16 for the GEMM of larger chunks (a row's 64 weights per 128-byte store, staged in shared memory), plus the `LinearNVFP4` module entry in skinny_kernels.cu (CPU has a mirrored implementation) | `test_nvfp4_linear`, `test_ops_linear`, `bench_nvfp4_shapes`, `test_mma_frag` |
+| `nvfp4_vk.cu` | the same kernels as PTX entry points with C names (`cuda_nvfp4.ptx`, beside `cuda_gemm.ptx`) for the Vulkan backend's CUDA launches below the dequantized chunks, skinny_kernels.cu's choice by row count | `test_ops_linear` (Vulkan build) |
 | `moe_kernels.cu` | fused routed experts: dispatch by expert, gate / up / SiLU, down + ordered weighted sum; up to 8 rows per pass of an expert's weights | `bench_nvfp4_moe` (parity with the chained calls), `test_cpu_nvfp4_vs_gpu` |
 
 ## GGUF weights
@@ -42,8 +43,9 @@ the tests are described in [TESTS.md](TESTS.md). `gate.sh sass` fingerprints eve
 for the language models' dense products (on ROCm it forwards to hipBLAS); the device code is `gemm_f16_kernel.cuh`. Verified by `test_gemm`, `bench_gemm`.
 `gemm_f16_vk.cu` makes the same kernels PTX entry points with C names (`cuda_gemm.ptx` in the Vulkan build's kernel directory, where nvcc is
 found): on NVIDIA GPUs whose Vulkan driver has `VK_NV_cuda_kernel_launch` but no cooperative matrices (Volta) the Vulkan backend launches them
-from its command buffers for every FP16 matmul (`src/backend/vulkan/mod_cuda.cpp`, gemm_f16.cu's tiles and split-k; `vk_cuda_launch` turns it
-off), held against the CUDA goldens by `test_ops_linear`, `test_ops_flash` and `test_ops_moe`.
+from its command buffers for every FP16 matmul (`src/backend/vulkan/mod_cuda.cpp`, gemm_f16.cu's tiles and split-k; GGUF prefill chunks
+dequantize their weight in slices for it; `vk_cuda_launch` turns it off), held against the CUDA goldens by `test_ops_linear`, `test_ops_flash`
+and `test_ops_moe`.
 
 ## Module kernels: `src/backend/cuda/modules/`
 
@@ -132,7 +134,9 @@ with the codebook's byte sum as a packed dot product where the device has one): 
 extended trellis' tile starts and gains (the MoE's experts), held against the CUDA kernels by
 `test_ops_linear` (`bench_trellis_shapes`). `nvfp4.slang` holds the Vulkan NVFP4 linear (`nvfp4_gemv` compiled for 1, 2, 4 and 8 rows: a lane per
 column of a 32-column tile, the warps over contiguous slices of K eight groups at a time, each warp's activations converted to FP32 once into
-shared memory, the weights decoded once per K group for every row; `nvfp4_dequant` for llama.cpp's matmul beyond; `nvfp4_gemm` the reference) and
+shared memory, the weights decoded once per K group for every row; `nvfp4_dequant` for the FP16 matmul beyond, staged in shared memory so a
+row's 64 weights go out as one 128-byte store; `nvfp4_gemm` the reference; where the device launches CUDA kernels, CUDA's own below the
+dequantized chunks) and
 the NVFP4 experts (`nvfp4_moe_gate_up`, `nvfp4_moe_down`: a workgroup per 32-column tile and route, a lane per column of the prepacked layout,
 the weights rounded to FP16 as the CUDA kernels round them), held against the CUDA kernels by `test_ops_linear` and `test_ops_moe`. `kv_codec.slang` holds the KV cache element codecs (FP8, int8, Q4, NVFP4 with
 their scales) that `kv_store_q` and the attention kernels (`ref_attention`, `fa`, the QSA sparse attention in `flash`, the latent attention in `glm`) share; the stored bytes and scales are checked bit for bit against the CUDA kernels by

@@ -47,6 +47,9 @@ Per GPU specifications:
 - **Line Rate Cycle Math (@ 1.53 GHz)**:
   $$\frac{900\text{ GB/s}}{80\text{ SMs} \times 1.53\text{ GHz}} = \mathbf{7.35\text{ bytes per SM cycle}}$$
   A 32-byte weight slice must be processed in **$\le 4.3$ cycles** to sustain 100% bus saturation.
+- **Vulkan allocations**: buffers in memory that is not a dedicated allocation run kernels whose reads stride far apart (a GEMM over
+  17408-wide rows) at about half the speed of the same kernel on CUDA memory, as if each access missed address translation; with
+  `VkMemoryDedicatedAllocateInfo` they run as on CUDA. The Vulkan backend allocates every device buffer that way.
 
 ---
 
