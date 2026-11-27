@@ -98,6 +98,9 @@ endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -fno-exceptions -DNO_EXCEPTIONS -DJSON_NOEXCEPTION")
 
+# libvolta: the C++ API of inc/volta/volta.h as a shared library (built in the Vulkan configuration; cmake/vulkan_backend.cmake)
+option(ENGINE_LIBRARY "build libvolta.so (Vulkan configuration)" OFF)
+
 # The CPU backend is the speed of the host's FP16 conversions and FMAs (the reference kernels convert every operand); the baseline x86-64 target has neither
 option(ENGINE_CPU_NATIVE "CPU backend: compile for the build host (-march=native)" ON)
 if(ENGINE_BACKEND STREQUAL "CPU" AND ENGINE_CPU_NATIVE)

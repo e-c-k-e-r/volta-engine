@@ -57,6 +57,7 @@ struct ServerConfig {
 	TtsConfig tts;
 
 	bool load_from_json( const char* json_path );
+	bool load_from_json_text( const std::string& text, const char* name = "the launch config" );   // the same from the file's text (the library)
 	// Parses --config and the CLI, then resolves and validates (model_dir, model_type, draft dir). Exits with status 2 on error.
 	void parse_cli_args( int argc, char** argv );
 	bool resolve();

@@ -1,0 +1,8 @@
+/* libvolta's exported symbols: namespace volta (inc/volta/volta.h) and nothing else */
+{
+	global:
+		extern "C++" {
+			volta::*;
+		};
+	local: *;
+};

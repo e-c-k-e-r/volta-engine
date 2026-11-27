@@ -4,8 +4,19 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 namespace engine::core {
+
+namespace {
+std::mutex sink_mu;
+std::function<void( LogLevel, const char* )> sink;
+}
+
+void set_log_sink( std::function<void( LogLevel level, const char* line )> s ) {
+	std::lock_guard<std::mutex> lock( sink_mu );
+	sink = std::move( s );
+}
 
 LogLevel log_level() {
 	static const LogLevel level = [] {
@@ -30,6 +41,14 @@ void log_write( LogLevel level, const char* fmt, ... ) {
 	if ( n >= static_cast<int>( sizeof( buf ) ) - 2 ) n = static_cast<int>( sizeof( buf ) ) - 3;
 	if ( n == 0 || buf[n - 1] != '\n' ) buf[n++] = '\n';
 	buf[n] = '\0';
+	{
+		std::lock_guard<std::mutex> lock( sink_mu );
+		if ( sink ) {
+			buf[n - 1] = '\0';
+			sink( level, buf + std::strlen( prefix[static_cast<int>( level )] ) );
+			return;
+		}
+	}
 	std::fputs( buf, level <= LogLevel::Warn ? stderr : stdout );
 }
 

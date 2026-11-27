@@ -57,10 +57,13 @@ bool ServerConfig::load_from_json( const char* json_path ) {
 	if ( r != static_cast<size_t>( size ) ) {
 		return false;
 	}
+	return load_from_json_text( buffer, json_path );
+}
 
-	auto j = nlohmann::json::parse( buffer, nullptr, false );
-	if ( j.is_discarded() ) {
-		LOG_ERROR( "Error: Failed to parse JSON config: %s\n", json_path );
+bool ServerConfig::load_from_json_text( const std::string& text, const char* name ) {
+	auto j = nlohmann::json::parse( text, nullptr, false );
+	if ( j.is_discarded() || !j.is_object() ) {
+		LOG_ERROR( "Error: Failed to parse JSON config: %s\n", name );
 		return false;
 	}
 

@@ -1,6 +1,9 @@
 #pragma once
 
 #include "engine/backend/runtime.h"
+#include <mutex>
+#include <string>
+#include <vector>
 
 // Vulkan-only layer below the portable runtime.h: availability, compute pipelines from SPIR-V and dispatch recording.
 // The kernels take their parameters as a push-constant block (Slang `uniform Params p`, std430 layout: natural C layout with
@@ -8,6 +11,26 @@
 namespace engine::backend::vk {
 
 struct Pipeline;
+
+// Before the first Vulkan call (the library): which physical device logical device 0 is, by index (-1: ENGINE_VK_DEVICE, else 0) or by
+// VkPhysicalDeviceProperties::deviceID (when not 0); the logical devices after it take the physical devices after it
+void select_device( int index, uint32_t pci_device_id );
+
+// Or a host application's device, the only one (logical device 0): its VkInstance, VkPhysicalDevice, VkDevice and a VkQueue of a family with
+// compute, never destroyed here; what the device was created with (the VkPhysicalDeviceFeatures2 chain, the extension names), which must hold
+// every feature the backend enables on its own devices; and the mutex held around submissions to the queue (null: no one else submits to it)
+struct HostDevice {
+	void* instance = nullptr;
+	void* physical_device = nullptr;
+	void* device = nullptr;
+	void* queue = nullptr;
+	uint32_t queue_family = 0;
+	std::mutex* queue_mutex = nullptr;
+	const void* enabled_features = nullptr;
+	std::vector<std::string> enabled_extensions;
+};
+// Before the first Vulkan call; false with *error when the device lacks a feature or extension the kernels need
+bool adopt_device( const HostDevice& host, std::string* error );
 
 // True when an instance and a device with the required features (BDA, Float16, Int64, timeline semaphores) exist
 bool available();

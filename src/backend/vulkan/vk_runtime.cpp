@@ -57,6 +57,7 @@ struct Ctx {
 	VkPhysicalDeviceProperties props{};
 	PFN_vkCmdPushDescriptorSetKHR push_descriptor = nullptr;
 	std::mutex queue_mu;        // vkQueueSubmit / vkQueueWaitIdle need external synchronization: a device's queue is shared by the threads that use it
+	std::mutex* host_queue_mu = nullptr;   // an adopted device's: the host application's mutex for the queue (instead of queue_mu)
 	bool host_import = false;   // VK_EXT_external_memory_host: a host allocation imported as device-addressable memory
 	bool sem_fd = false;        // VK_KHR_external_semaphore_fd: timeline semaphores shared with the other devices
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
@@ -88,6 +89,11 @@ struct Shared {
 	VkInstance instance = VK_NULL_HANDLE;
 	std::vector<VkPhysicalDevice> phys;
 	int base = 0;
+	int select_index = -1;       // select_device: the base by index (-1: ENGINE_VK_DEVICE) or by PCI device ID
+	uint32_t select_pci = 0;
+	bool adopted = false;        // adopt_device: the host's instance and device
+	vk::HostDevice host;
+	std::string adopt_error;     // why the adopted device can't be used
 };
 
 constexpr int MAX_DEV = ENGINE_NUM_GPUS;
@@ -95,6 +101,7 @@ Shared sh;
 Ctx gs[MAX_DEV];
 thread_local int t_dev = 0;
 inline Ctx& cur() { return gs[t_dev]; }
+inline std::mutex& queue_mutex( Ctx& c ) { return c.host_queue_mu ? *c.host_queue_mu : c.queue_mu; }
 
 } // namespace
 
@@ -165,7 +172,14 @@ namespace {
 bool init_instance() {
 	if ( sh.tried ) return sh.instance != VK_NULL_HANDLE && !sh.phys.empty();
 	sh.tried = true;
-	if ( const char* e = std::getenv( "ENGINE_VK_DEVICE" ) ) sh.base = std::atoi( e );
+	if ( sh.adopted ) {
+		sh.instance = static_cast<VkInstance>( sh.host.instance );
+		sh.phys = { static_cast<VkPhysicalDevice>( sh.host.physical_device ) };
+		sh.base = 0;
+		return true;
+	}
+	if ( sh.select_index >= 0 ) sh.base = sh.select_index;
+	else if ( const char* e = std::getenv( "ENGINE_VK_DEVICE" ) ) sh.base = std::atoi( e );
 	VkApplicationInfo app{ VK_STRUCTURE_TYPE_APPLICATION_INFO };
 	app.pApplicationName = "volta-engine";
 	app.apiVersion = VK_API_VERSION_1_2;
@@ -176,7 +190,92 @@ bool init_instance() {
 	vkEnumeratePhysicalDevices( sh.instance, &n, nullptr );
 	sh.phys.resize( n );
 	vkEnumeratePhysicalDevices( sh.instance, &n, sh.phys.data() );
+	if ( sh.select_pci != 0 ) {
+		sh.base = -1;
+		for ( uint32_t i = 0; i < n && sh.base < 0; ++i ) {
+			VkPhysicalDeviceProperties p;
+			vkGetPhysicalDeviceProperties( sh.phys[i], &p );
+			if ( p.deviceID == sh.select_pci ) sh.base = static_cast<int>( i );
+		}
+		if ( sh.base < 0 ) {
+			std::fprintf( stderr, "[-] Vulkan backend: no physical device with PCI device ID 0x%04x\n", sh.select_pci );
+			return false;
+		}
+	}
 	return n > 0;
+}
+
+// What an adopted device was created with: the features of the VkPhysicalDeviceFeatures2 chain (the Vulkan 1.1 / 1.2 / 1.3 structs or the
+// single-feature ones) the backend looks at, and its extensions
+struct Enabled {
+	bool int64 = false, int16 = false, float64 = false, sb16 = false, usb16 = false, bda = false, fp16 = false, timeline = false, int8 = false, sb8 = false;
+	bool dot = false, sg_ctl = false;
+	std::vector<std::string> exts;
+	bool has( const char* e ) const {
+		for ( const auto& x : exts ) {
+			if ( x == e ) return true;
+		}
+		return false;
+	}
+};
+Enabled enabled_of( const vk::HostDevice& h ) {
+	Enabled e;
+	e.exts = h.enabled_extensions;
+	for ( auto* b = static_cast<const VkBaseInStructure*>( h.enabled_features ); b != nullptr; b = b->pNext ) {
+		switch ( b->sType ) {
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2: {
+				const auto* f = reinterpret_cast<const VkPhysicalDeviceFeatures2*>( b );
+				e.int64 = f->features.shaderInt64;
+				e.int16 = f->features.shaderInt16;
+				e.float64 = f->features.shaderFloat64;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES: {
+				const auto* f = reinterpret_cast<const VkPhysicalDeviceVulkan11Features*>( b );
+				e.sb16 = e.sb16 || f->storageBuffer16BitAccess;
+				e.usb16 = e.usb16 || f->uniformAndStorageBuffer16BitAccess;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES: {
+				const auto* f = reinterpret_cast<const VkPhysicalDevice16BitStorageFeatures*>( b );
+				e.sb16 = e.sb16 || f->storageBuffer16BitAccess;
+				e.usb16 = e.usb16 || f->uniformAndStorageBuffer16BitAccess;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES: {
+				const auto* f = reinterpret_cast<const VkPhysicalDeviceVulkan12Features*>( b );
+				e.bda = e.bda || f->bufferDeviceAddress;
+				e.fp16 = e.fp16 || f->shaderFloat16;
+				e.timeline = e.timeline || f->timelineSemaphore;
+				e.int8 = e.int8 || f->shaderInt8;
+				e.sb8 = e.sb8 || f->storageBuffer8BitAccess;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES: {
+				e.bda = e.bda || reinterpret_cast<const VkPhysicalDeviceBufferDeviceAddressFeatures*>( b )->bufferDeviceAddress;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES: {
+				const auto* f = reinterpret_cast<const VkPhysicalDeviceShaderFloat16Int8Features*>( b );
+				e.fp16 = e.fp16 || f->shaderFloat16;
+				e.int8 = e.int8 || f->shaderInt8;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES: {
+				e.timeline = e.timeline || reinterpret_cast<const VkPhysicalDeviceTimelineSemaphoreFeatures*>( b )->timelineSemaphore;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES: {
+				e.sb8 = e.sb8 || reinterpret_cast<const VkPhysicalDevice8BitStorageFeatures*>( b )->storageBuffer8BitAccess;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES: {
+				const auto* f = reinterpret_cast<const VkPhysicalDeviceVulkan13Features*>( b );
+				e.dot = e.dot || f->shaderIntegerDotProduct;
+				e.sg_ctl = e.sg_ctl || f->subgroupSizeControl;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES: {
+				e.dot = e.dot || reinterpret_cast<const VkPhysicalDeviceShaderIntegerDotProductFeatures*>( b )->shaderIntegerDotProduct;
+			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
+				e.sg_ctl = e.sg_ctl || reinterpret_cast<const VkPhysicalDeviceSubgroupSizeControlFeatures*>( b )->subgroupSizeControl;
+			} break;
+			default: break;
+		}
+	}
+	return e;
 }
 
 vk_stream* make_stream( Ctx& g );
@@ -188,6 +287,8 @@ bool init_context( int dev ) {
 	if ( g.tried ) return g.ok;
 	g.tried = true;
 	if ( !init_instance() ) return false;
+	if ( sh.adopted && dev != 0 ) return false;   // the host's device is the only one
+	const Enabled en = sh.adopted ? enabled_of( sh.host ) : Enabled();
 	g.device_index = sh.base + dev;
 	if ( g.device_index < 0 || size_t( g.device_index ) >= sh.phys.size() ) return false;
 	g.phys = sh.phys[g.device_index];
@@ -217,6 +318,17 @@ bool init_context( int dev ) {
 			has_sg_ctl = has_sg_ctl || std::strcmp( e.extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME ) == 0;
 		}
 	}
+	if ( sh.adopted ) {
+		// the extensions the host enabled (subgroup size control and integer dot products are core in Vulkan 1.3)
+		const bool v13 = g.props.apiVersion >= VK_API_VERSION_1_3;
+		has_dot_ext = en.has( VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME ) || ( v13 && en.dot );
+		has_push_desc = en.has( VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME );
+		has_host_import = en.has( VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME );
+		has_sem_fd = en.has( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
+		has_mem_fd = en.has( VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME );
+		has_budget = en.has( VK_EXT_MEMORY_BUDGET_EXTENSION_NAME );
+		has_sg_ctl = en.has( VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME ) || ( v13 && en.sg_ctl );
+	}
 	// The kernels that reduce over a warp (subgroup operations, lane = thread % 32) take subgroups of 32: a device whose compute subgroups are
 	// another size by default (AMD's wave64, Intel's SIMD8 / 16) gets every pipeline created with a required subgroup size of 32 where it allows it
 	VkPhysicalDeviceSubgroupSizeControlPropertiesEXT sgp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT };
@@ -234,13 +346,43 @@ bool init_context( int dev ) {
 	VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11 };
 	VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12 };
 	vkGetPhysicalDeviceFeatures2( g.phys, &f2 );
-	if ( !f12.bufferDeviceAddress || !f12.shaderFloat16 || !f12.timelineSemaphore || !f2.features.shaderInt64 ) return false;
+	if ( !f12.bufferDeviceAddress || !f12.shaderFloat16 || !f12.timelineSemaphore || !f2.features.shaderInt64 ) {
+		sh.adopt_error = "the device lacks bufferDeviceAddress, shaderFloat16, timelineSemaphore or shaderInt64";
+		return false;
+	}
+	if ( sh.adopted ) {
+		// every feature the backend enables on a device of its own (those this one supports) must be enabled on the host's
+		std::string missing;
+		auto need = [&]( bool supported, bool on, const char* name ) {
+			if ( supported && !on ) missing += std::string( missing.empty() ? "" : ", " ) + name;
+		};
+		need( true, en.bda, "bufferDeviceAddress" );
+		need( true, en.fp16, "shaderFloat16" );
+		need( true, en.timeline, "timelineSemaphore" );
+		need( true, en.int64, "shaderInt64" );
+		need( f11.storageBuffer16BitAccess, en.sb16, "storageBuffer16BitAccess" );
+		need( f11.uniformAndStorageBuffer16BitAccess, en.usb16, "uniformAndStorageBuffer16BitAccess" );
+		need( f12.shaderInt8, en.int8, "shaderInt8" );
+		need( f12.storageBuffer8BitAccess, en.sb8, "storageBuffer8BitAccess" );
+		need( f2.features.shaderInt16, en.int16, "shaderInt16" );
+		need( f2.features.shaderFloat64, en.float64, "shaderFloat64" );
+		if ( !missing.empty() ) {
+			sh.adopt_error = "the host's device was created without " + missing;
+			return false;
+		}
+		fdot.shaderIntegerDotProduct = en.dot ? fdot.shaderIntegerDotProduct : VK_FALSE;
+		fsg.subgroupSizeControl = en.sg_ctl ? fsg.subgroupSizeControl : VK_FALSE;
+	}
 
 	g.int_dot = has_dot_ext && fdot.shaderIntegerDotProduct == VK_TRUE;
 	if ( sg.subgroupSize != 32 ) {
 		g.sg32 = has_sg_ctl && fsg.subgroupSizeControl == VK_TRUE && sgp.minSubgroupSize <= 32 && sgp.maxSubgroupSize >= 32 &&
 			( sgp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ) != 0;
 		if ( !g.sg32 ) std::fprintf( stderr, "[-] Vulkan backend: %s runs subgroups of %u and can't be made to run 32 (the warp-wide kernels assume 32)\n", g.props.deviceName, sg.subgroupSize );
+		if ( !g.sg32 && sh.adopted ) {
+			sh.adopt_error = "the device runs subgroups of " + std::to_string( sg.subgroupSize ) + ": the host's device needs subgroupSizeControl (VK_EXT_subgroup_size_control or Vulkan 1.3)";
+			return false;
+		}
 	}
 	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT want_sg{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
 	want_sg.subgroupSizeControl = VK_TRUE;
@@ -271,6 +413,11 @@ bool init_context( int dev ) {
 	for ( uint32_t i = 0; i < qn && !found; ++i ) {
 		if ( qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) { g.family = i; found = true; }
 	}
+	if ( sh.adopted ) {
+		found = sh.host.queue_family < qn && ( qf[sh.host.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT ) != 0;
+		if ( !found ) sh.adopt_error = "the host's queue family has no compute";
+		g.family = sh.host.queue_family;
+	}
 	if ( !found ) return false;
 
 	const float prio = 1.0f;
@@ -290,7 +437,12 @@ bool init_context( int dev ) {
 	if ( g.sg32 ) exts.push_back( VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME );
 	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
 	dci.ppEnabledExtensionNames = exts.data();
-	if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) return false;
+	if ( sh.adopted ) {
+		g.device = static_cast<VkDevice>( sh.host.device );
+		g.host_queue_mu = sh.host.queue_mutex;
+	} else if ( vkCreateDevice( g.phys, &dci, nullptr, &g.device ) != VK_SUCCESS ) {
+		return false;
+	}
 	g.budget = has_budget;
 	if ( has_push_desc ) g.push_descriptor = reinterpret_cast<PFN_vkCmdPushDescriptorSetKHR>( vkGetDeviceProcAddr( g.device, "vkCmdPushDescriptorSetKHR" ) );
 	g.host_import = has_host_import;
@@ -301,7 +453,8 @@ bool init_context( int dev ) {
 		vkGetPhysicalDeviceProperties2( g.phys, &pp );
 		g.host_import_align = hp.minImportedHostPointerAlignment;
 	}
-	vkGetDeviceQueue( g.device, g.family, 0, &g.queue );
+	if ( sh.adopted ) g.queue = static_cast<VkQueue>( sh.host.queue );
+	else vkGetDeviceQueue( g.device, g.family, 0, &g.queue );
 
 	g.get_address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>( vkGetDeviceProcAddr( g.device, "vkGetBufferDeviceAddress" ) );
 	if ( g.get_address == nullptr ) return false;
@@ -520,7 +673,7 @@ void submit( vk_stream* s, VkCommandBuffer cb ) {
 	si.pCommandBuffers = cb ? &cb : nullptr;
 	si.signalSemaphoreCount = static_cast<uint32_t>( signals.size() );
 	si.pSignalSemaphores = signals.data();
-	std::lock_guard<std::mutex> lk( cur().queue_mu );
+	std::lock_guard<std::mutex> lk( queue_mutex( cur() ) );
 	ENGINE_CHECK( vkQueueSubmit( cur().queue, 1, &si, VK_NULL_HANDLE ) );
 }
 
@@ -704,7 +857,7 @@ void device_sync() {
 	ctx();
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	sync( cur().default_stream );
-	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
+	{ std::lock_guard<std::mutex> qlk( queue_mutex( cur() ) ); vkQueueWaitIdle( cur().queue ); }
 }
 
 // A run of independent ops: off under vulkan_profile, which times each dispatch with its barrier
@@ -903,7 +1056,7 @@ void device_free( void* p ) {
 		cur().allocated -= a.size;
 		cur().allocs.erase( it );
 	}
-	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); } // cudaFree synchronizes implicitly
+	{ std::lock_guard<std::mutex> qlk( queue_mutex( cur() ) ); vkQueueWaitIdle( cur().queue ); } // cudaFree synchronizes implicitly
 	vkDestroyBuffer( cur().device, a.buffer, nullptr );
 	vkFreeMemory( cur().device, a.memory, nullptr );
 }
@@ -975,13 +1128,40 @@ void graph_launch( graph_exec_t e, stream_t st ) {
 }
 void graph_destroy( graph_t gr ) {
 	if ( !gr ) return;
-	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
+	{ std::lock_guard<std::mutex> qlk( queue_mutex( cur() ) ); vkQueueWaitIdle( cur().queue ); }
 	if ( !gr->segs.empty() ) vkFreeCommandBuffers( gr->pool->device, gr->pool->pool, static_cast<uint32_t>( gr->segs.size() ), gr->segs.data() );
 	delete gr;
 }
 void graph_exec_destroy( graph_exec_t e ) { graph_destroy( e ); }
 
 namespace vk {
+
+void select_device( int index, uint32_t pci_device_id ) {
+	std::lock_guard<std::mutex> lock( sh.mu );
+	sh.select_index = index;
+	sh.select_pci = pci_device_id;
+}
+
+bool adopt_device( const HostDevice& host, std::string* error ) {
+	{
+		std::lock_guard<std::mutex> lock( sh.mu );
+		if ( sh.tried ) {
+			*error = "the Vulkan backend is already initialized";
+			return false;
+		}
+		if ( !host.instance || !host.physical_device || !host.device || !host.queue ) {
+			*error = "an adopted device needs its instance, physical device, device and queue";
+			return false;
+		}
+		sh.adopted = true;
+		sh.host = host;
+	}
+	if ( !init_context( 0 ) ) {
+		*error = sh.adopt_error.empty() ? "the host's Vulkan device can't be used" : sh.adopt_error;
+		return false;
+	}
+	return true;
+}
 
 bool available() {
 	if ( !cur().ok && !init_context( t_dev ) ) return false;
@@ -992,30 +1172,39 @@ const char* device_name() { return ctx().props.deviceName; }
 uint32_t max_push_constants_bytes() { return ctx().props.limits.maxPushConstantsSize; }
 bool int_dot() { return ctx().int_dot; }
 
+// The library build links the kernels in (a generated table): the SPIR-V of a kernel by name, or null (weak: the other builds read the files)
+__attribute__(( weak )) const uint8_t* embedded_spv( const char* name, size_t* bytes );
+
 namespace {
 Pipeline* create_pipeline( const char* spv_path, uint32_t push_bytes, uint32_t buffers, const uint32_t* spec, uint32_t spec_count ) {
 	ctx();
 	if ( buffers > 0 && !cur().push_descriptor ) return nullptr;
 	if ( push_bytes > cur().props.limits.maxPushConstantsSize || push_bytes % 4 ) return nullptr;
-	FILE* f = std::fopen( spv_path, "rb" );
-	if ( !f ) return nullptr;
-	std::fseek( f, 0, SEEK_END );
-	const long n = std::ftell( f );
-	std::fseek( f, 0, SEEK_SET );
-	std::vector<uint32_t> code( ( size_t( n ) + 3 ) / 4 );
-	const bool read_ok = n > 0 && std::fread( code.data(), 1, size_t( n ), f ) == size_t( n );
-	std::fclose( f );
-	if ( !read_ok ) return nullptr;
+	std::string name( spv_path );
+	name = name.substr( name.find_last_of( '/' ) + 1 );
+	if ( name.size() > 4 && name.compare( name.size() - 4, 4, ".spv" ) == 0 ) name.resize( name.size() - 4 );
+	std::vector<uint32_t> code;
+	size_t embedded_bytes = 0;
+	const uint8_t* embedded = embedded_spv != nullptr && std::getenv( "ENGINE_SPV_DIR" ) == nullptr ? embedded_spv( name.c_str(), &embedded_bytes ) : nullptr;
+	if ( embedded != nullptr ) {
+		code.resize( ( embedded_bytes + 3 ) / 4 );
+		std::memcpy( code.data(), embedded, embedded_bytes );
+	} else {
+		FILE* f = std::fopen( spv_path, "rb" );
+		if ( !f ) return nullptr;
+		std::fseek( f, 0, SEEK_END );
+		const long n = std::ftell( f );
+		std::fseek( f, 0, SEEK_SET );
+		code.resize( ( size_t( n ) + 3 ) / 4 );
+		const bool read_ok = n > 0 && std::fread( code.data(), 1, size_t( n ), f ) == size_t( n );
+		std::fclose( f );
+		if ( !read_ok ) return nullptr;
+	}
 	if ( cur().rte16 && code.size() > 5 && code[0] == 0x07230203u ) code = with_rte16( code );
 
 	auto* p = new Pipeline();
 	p->push_bytes = push_bytes;
-	{
-		std::string n( spv_path );
-		n = n.substr( n.find_last_of( '/' ) + 1 );
-		if ( n.size() > 4 && n.compare( n.size() - 4, 4, ".spv" ) == 0 ) n.resize( n.size() - 4 );
-		p->name = n;
-	}
+	p->name = name;
 	VkShaderModuleCreateInfo smi{ VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
 	smi.codeSize = code.size() * 4;
 	smi.pCode = code.data();
@@ -1071,7 +1260,7 @@ Pipeline* pipeline_create_bound( const char* spv_path, uint32_t push_bytes, uint
 
 void pipeline_destroy( Pipeline* p ) {
 	if ( !p ) return;
-	{ std::lock_guard<std::mutex> qlk( cur().queue_mu ); vkQueueWaitIdle( cur().queue ); }
+	{ std::lock_guard<std::mutex> qlk( queue_mutex( cur() ) ); vkQueueWaitIdle( cur().queue ); }
 	if ( p->pipeline ) vkDestroyPipeline( cur().device, p->pipeline, nullptr );
 	if ( p->layout ) vkDestroyPipelineLayout( cur().device, p->layout, nullptr );
 	if ( p->module ) vkDestroyShaderModule( cur().device, p->module, nullptr );

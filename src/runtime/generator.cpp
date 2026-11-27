@@ -91,10 +91,12 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 
 	running_.store( true );
 	scheduler_thread_ = std::thread( &Generator::scheduler_loop, this );
-	cpu_set_t cpuset;
-	CPU_ZERO( &cpuset );
-	CPU_SET( 4, &cpuset );
-	pthread_setaffinity_np( scheduler_thread_.native_handle(), sizeof( cpu_set_t ), &cpuset );
+	if ( runtime::options().pin_threads ) {
+		cpu_set_t cpuset;
+		CPU_ZERO( &cpuset );
+		CPU_SET( 4, &cpuset );
+		pthread_setaffinity_np( scheduler_thread_.native_handle(), sizeof( cpu_set_t ), &cpuset );
+	}
 	return true;
 }
 

@@ -71,6 +71,7 @@ shown. Debug options use `ENGINE_DEBUG_<NAME>`. Test-only variables are listed a
 | Option | Type | Default | Environment | Description |
 |---|---|---|---|---|
 | `log_level` | string | `info` | `ENGINE_LOG_LEVEL` | log threshold: error, warn, info or debug |
+| `pin_threads` | bool | `true` | `ENGINE_PIN_THREADS` | the generator's scheduler thread pinned to CPU 4, beside the cores 0 to 3 the rank threads drive the GPUs from; false: the OS places it (libvolta's default, inside a host application) |
 | `tp` | int | `-1` | `ENGINE_TP` | rank count: 1, 2 or 4 (GLM: 1, 2 or 4; the CPU build runs one rank, the Vulkan build one device per rank); <0 uses the launch's tp_size |
 | `arena_gib` | int | `-1` | `ENGINE_ARENA_GIB` | per-GPU arena in GiB; <=0 sizes it from the device's free memory minus vram_reserve_mib |
 | `vram_reserve_mib` | int | `-1` | `ENGINE_VRAM_RESERVE_MIB` | memory left outside the arena for what the CUDA driver takes after it is sized (kernel code loaded on first use, graph instances); <0: 384 |

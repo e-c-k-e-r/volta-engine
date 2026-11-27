@@ -113,7 +113,8 @@ public:
 	virtual void on_finish( engine::runtime::FinishReason reason, const std::string& matched_stop, bool had_tool_calls, const Usage& usage ) = 0;
 };
 
-// Renders the prompt, applies server defaults and starts the generation. On failure fills err and sends nothing.
+// Renders the prompt, applies server defaults and starts the generation. On failure fills err and sends nothing. conn may be null (the library:
+// the responder alone decides when to stop)
 bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
 	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err );
 

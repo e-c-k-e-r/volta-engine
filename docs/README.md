@@ -37,6 +37,7 @@
 * [CONFIG.md](CONFIG.md): every option (generated from the option table, do not edit by hand)
 * [STEERING.md](STEERING.md): runtime steering (control vectors, the probe and its direction clamp, the reflection-marker penalty)
 * [VIDEO.md](VIDEO.md): MiniMax-H3 video and audio generation
+* [LIBRARY.md](LIBRARY.md): libvolta, the engine as a shared library for a host application (text and speech through one C++ header, on the engine's Vulkan device or the host's)
 * [ARCHITECTURE.md](ARCHITECTURE.md): the layers, the execution model, and how requests flow
 * [CAPABILITIES.md](CAPABILITIES.md): which module functions each backend implements (generated)
 * [KERNEL_MAP.md](KERNEL_MAP.md): kernel family -> file -> what verifies it

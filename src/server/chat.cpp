@@ -569,7 +569,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 	}
 	const bool raw = req.raw;
 	g.on_text = [state, raw]( const std::string& delta ) {
-		if ( state->conn->closed() ) return false;
+		if ( state->conn && state->conn->closed() ) return false;
 		if ( raw ) return state->responder->on_event( { OutputEvent::Type::Content, delta, {} } );   // plain text: nothing to parse out
 		std::vector<OutputEvent> events;
 		state->parser.feed( delta, events );
@@ -578,7 +578,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 		}
 		return true;
 	};
-	g.on_wait = [state]() { return !state->conn->closed() && state->responder->on_wait(); };
+	g.on_wait = [state]() { return !( state->conn && state->conn->closed() ) && state->responder->on_wait(); };
 	g.on_admit = [state]( int cached ) { state->responder->on_admit( cached ); };
 	if ( req.logprobs >= 0 ) {
 		const engine::loader::Tokenizer* tk = &gen.tokenizer();
