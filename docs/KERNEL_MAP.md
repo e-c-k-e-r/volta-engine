@@ -46,7 +46,7 @@ for the language models' dense products (on ROCm it forwards to hipBLAS). Verifi
 | File | Kernels | Verified by |
 |---|---|---|
 | `attention.cu` | decode / prefill tensor-core attention, KV store (FP16, FP8, K8V4, NVFP4) | `test_attention`, `test_attention_prefill`, `test_kv_quant`, `test_ops_attention` |
-| `gdn.cu` | GDN / KDA projections, conv1d, recurrent step, per-row snapshots | `test_gdn`, `test_slang_kernels`, `test_ops_attention` |
+| `gdn.cu` | GDN / KDA projections, conv1d, recurrent step, per-row snapshots; the chunked delta rule of prefill chunks (`gdn_chunk_prep_kernel`: a chunk's decayed query-key products, the inverse of its key matrix in 16 x 16 blocks, W and U; `gdn_chunk_scan_kernel`: the chunks in order on the tensor cores, the state's FP32 operands split into FP16 halves; `gdn_chunk_out_kernel`: the outputs of every chunk) | `test_gdn`, `test_slang_kernels`, `test_ops_attention` |
 | `mla_latent.cu` | absorbed latent attention (dense, sparse, split-KV; latent cache FP16, FP8, int8 or NVFP4 via kv_format) | `test_mla_latent`, `test_ref_attention` |
 | `gated_residual.cu` | Flash-Next gated residual (norm, low-rank gate, mix, post gate, apply), MTP stream norm / broadcast, shared-expert gate | `test_gr_tc`, `test_gr_decode`, `test_ops_flash` |
 | `ple.cu` (with the host table reader `src/loader/ngram_table.cpp`: mul1 ring codec, hashing) | Flash-Next n-gram embedding layer: gate, grouped norms, dilated conv ring | `test_ops_flash`, `test_prefix_restore --model qwen4_exp` |
@@ -115,7 +115,9 @@ lane holds its dimensions of the query vectors and accumulators, each warp strea
 and `fa_dense_64` is the head_dim 64 form of that (a thread per query with its accumulators in registers, a warp per quarter of each 64-key tile,
 FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`). `attn_prep.slang`'s `norm_rope_store` is
 the step before the attention in one kernel (`Attention::norm_rope_store`: q / k / v head norms, the rotary embedding of q and k, k and v into
-an FP16 cache, a group per row and head), bit for bit the three kernels it replaces; other cache formats take those three. `tts.slang` holds the
+an FP16 cache, a group per row and head), bit for bit the three kernels it replaces; other cache formats take those three. `gdn_chunk.slang` is the
+Vulkan form of the GDN prefill's chunked delta rule (the CUDA kernels' three steps in FP32 on the shader cores, held against the rows kernel and the
+CUDA kernels by `test_ops_attention`). `tts.slang` holds the
 TTS and NeMo codec operators of the Vulkan build (embedding mix, the norms, QK norm + RoPE, gate, SwiGLU, the flow head's AdaLN and guided step,
 FSQ, the codec's K-major columns, HalfSnake, interleave); the CUDA forms are `src/backend/cuda/modules/tts.cu`, and the Vulkan GEMMs are llama.cpp's
 FP16 matmul (FP16 or FP32 out) and its FP32 one (`bench_tts_ops`). `trellis.slang` is the Vulkan EXL3 linear, compiled once per width code (and

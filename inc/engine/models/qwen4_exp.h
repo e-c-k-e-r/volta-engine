@@ -307,6 +307,7 @@ private:
 	int* qsa_nkeys_ = nullptr;                // [R]
 	// GDN buffers
 	pod::TensorView qkv_buf_, conv_out_, z_buf_, gdn_out_, gdn_gate_, gdn_beta_;
+	void* gdn_chunk_scratch_ = nullptr;   // GDN::recurrent_step_chunked scratch for prefill chunks
 
 	Qwen4ExpGatedResidual final_mixer_;
 	pod::LinearWeight lm_head_;

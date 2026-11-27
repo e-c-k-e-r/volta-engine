@@ -1,5 +1,5 @@
-// Vulkan backend: Gated DeltaNet entry points with a Slang kernel (gates, L2 norm, multi-row conv and recurrence, gated norm) and the single-row
-// conv / recurrence forms composed from the rows kernels. The KDA forms stay weak stubs (stubs_gdn.cpp).
+// Vulkan backend: Gated DeltaNet entry points with a Slang kernel (gates, L2 norm, multi-row conv and recurrence, the chunked prefill
+// recurrence, gated norm) and the single-row conv / recurrence forms composed from the rows kernels. The KDA forms stay weak stubs (stubs_gdn.cpp).
 #include "mod_common.h"
 #include "engine/modules/gdn.h"
 #include <cmath>
@@ -132,6 +132,46 @@ void GDN::recurrent_step_rows(
 		1.0f / std::sqrt( static_cast<float>( head_dim ) ), static_cast<int64_t>( slot_stride ), static_cast<int64_t>( snap_stride ) };
 	// Group = (head, 1, column block), as the CUDA launcher: 32 x 4 threads, 32 blocks along z
 	vki::launch( "recurrent_step_rows", p, stream, num_v_heads, 1, 32 );
+}
+
+// The chunked delta rule on the shader cores (gdn_chunk.slang): the scratch holds, per head and 64-row chunk, W and U, P, gamma, the state
+// entering the chunk and its Delta (FP32), and per K head the padded K / Q of a partial last chunk
+size_t GDN::recurrent_step_chunked_scratch_bytes( int rows, int num_k_heads, int num_v_heads ) {
+	const size_t hc = static_cast<size_t>( rows + 63 ) / 64 * num_v_heads;
+	return hc * ( 16384 + 4096 + 64 + 16384 + 8192 ) * sizeof( float ) + static_cast<size_t>( num_k_heads ) * 2 * 64 * 128 * sizeof( backend::half_t );
+}
+
+void GDN::recurrent_step_chunked(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& gate,
+	const pod::TensorView& beta,
+	pod::TensorView& attn_out,
+	int num_k_heads,
+	int num_v_heads,
+	int head_dim,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	void* scratch,
+	backend::stream_t stream
+) {
+	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step_chunked (Vulkan): the kernels are specialized for head_dim 128" );
+	ENGINE_ASSERT( num_v_heads % num_k_heads == 0, "GDN::recurrent_step_chunked (Vulkan): v heads must be a multiple of k heads" );
+	const int chunks = ( rows + 63 ) / 64;
+	const size_t hc = static_cast<size_t>( chunks ) * num_v_heads;
+	float* wu = static_cast<float*>( scratch );
+	float* pm = wu + hc * 16384;
+	float* gam = pm + hc * 4096;
+	float* s0 = gam + hc * 64;
+	float* dd = s0 + hc * 16384;
+	backend::half_t* pad = reinterpret_cast<backend::half_t*>( dd + hc * 8192 );
+	vki::ChunkGdnParams p{ vki::dp( qkv.data ), vki::dp( gate.data ), vki::dp( beta.data ), vki::dp( gdn_state ), vki::rows_slot( d_rows ), vki::dp( attn_out.data ),
+		vki::dp( wu ), vki::dp( pm ), vki::dp( gam ), vki::dp( s0 ), vki::dp( dd ), vki::dp( pad ), num_k_heads, num_v_heads, rows,
+		1.0f / std::sqrt( static_cast<float>( head_dim ) ), static_cast<int64_t>( slot_stride ) };
+	vki::launch( "gdn_chunk_prep", p, stream, num_v_heads, chunks );
+	vki::launch( "gdn_chunk_scan", p, stream, num_v_heads, 128 / 16 );
+	vki::launch( "gdn_chunk_out", p, stream, num_v_heads, chunks, 128 / 32 );
 }
 
 void GDN::gated_rmsnorm(

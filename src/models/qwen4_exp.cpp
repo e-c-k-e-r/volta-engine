@@ -368,6 +368,10 @@ bool Qwen4ExpPipeline::init( int device_id, pod::MemoryArena& arena, engine::com
 	int qkv_shape[2] = { R, lin_channels_ };
 	qkv_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
 	conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, qkv_shape, 2 );
+	{
+		const size_t chunk_bytes = engine::modules::GDN::recurrent_step_chunked_scratch_bytes( R, lin_k_heads_, lin_v_heads_ );
+		if ( chunk_bytes > 0 ) gdn_chunk_scratch_ = engine::core::arena_alloc( arena, chunk_bytes );
+	}
 	int z_shape[2] = { R, lin_v_heads_ * config_.linear_head_dim };
 	z_buf_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
 	gdn_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, z_shape, 2 );
@@ -1381,8 +1385,14 @@ void Qwen4ExpPipeline::gdn_forward( const Qwen4ExpLayerWeights& lw, int linear_i
 	}
 	engine::modules::GDN::l2_norm_heads( qkv_rows, k_heads, config_.linear_head_dim, stream, false, m, channels );
 	if ( overlap ) backend::stream_join( stream, sk );
-	engine::modules::GDN::recurrent_step_rows( layer_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads, config_.linear_head_dim, m, d_rows_,
-		state_.slot_gdn_floats, gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream );
+	if ( m > pod::MAX_BATCH && runtime::options().gdn_chunked ) {
+		engine::modules::GDN::recurrent_step_chunked( layer_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads, config_.linear_head_dim, m, d_rows_,
+			state_.slot_gdn_floats, gdn_chunk_scratch_, stream );
+	}
+	else {
+		engine::modules::GDN::recurrent_step_rows( layer_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads, config_.linear_head_dim, m, d_rows_,
+			state_.slot_gdn_floats, gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream );
+	}
 	// Sigmoid-gated RMSNorm (the KDA flavor): rmsnorm(out) * w * sigmoid(z)
 	engine::modules::GDN::gated_rmsnorm( out_rows, z_rows, lw.linear_norm, v_heads, config_.linear_head_dim, stream, true, m );
 	hessian( hess_layer_, 2, gdn_out_.data, v_heads * 128, m, stream );

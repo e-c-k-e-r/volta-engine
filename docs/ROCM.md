@@ -127,7 +127,8 @@ the host for each kernel launch, so on ROCm they report the count instead of fai
 
 * The EXL3 GEMV (1 to 4 rows): its per-row products use `v_dot2`.
 * The MoE kernels other than the expert-grouped one (`moe_kernels.cu`, `exl3_moe_coop.cu`) and the int8 GEMV.
-* The linear-attention (GDN) prefill recurrence, which is serial per head.
+* The linear-attention (GDN) prefill recurrence, which is serial per head: the chunked form of the CUDA build stages more shared memory
+  than a workgroup has, so ROCm runs the rows kernel.
 
 ## Performance
 

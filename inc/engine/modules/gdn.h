@@ -110,6 +110,28 @@ struct GDN {
 		backend::stream_t stream
 	);
 
+	// Prefill form of recurrent_step_rows (rows above the decode sizes, at most pod::MAX_ROWS, one slot): the chunked delta rule over
+	// 64-row chunks. The terms of a chunk that do not depend on the state (the triangular solve over its keys, the decayed query-key
+	// products) are computed for every chunk at once, then the state advances a chunk at a time. The same recurrence with its sums in
+	// another order, so not bit-identical to the row-by-row form. scratch: recurrent_step_chunked_scratch_bytes( rows, ... ) bytes of
+	// device memory (0 where the form runs the rows kernel).
+	static size_t recurrent_step_chunked_scratch_bytes( int rows, int num_k_heads, int num_v_heads );
+	static void recurrent_step_chunked(
+		float* gdn_state,                 // layer base; slot s at + s * slot_stride
+		const pod::TensorView& qkv,       // [rows, (2 * k_heads + v_heads) * head_dim]
+		const pod::TensorView& gate,      // [rows, v_heads]
+		const pod::TensorView& beta,
+		pod::TensorView& attn_out,        // [rows, v_heads * head_dim]
+		int num_k_heads,
+		int num_v_heads,
+		int head_dim,
+		int rows,
+		const pod::BatchRows* d_rows,
+		size_t slot_stride,
+		void* scratch,
+		backend::stream_t stream
+	);
+
 	static void project_kda_gates(
 		const pod::TensorView& norm_hidden,
 		const pod::TensorView& b_proj,

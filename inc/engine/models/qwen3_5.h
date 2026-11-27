@@ -213,6 +213,7 @@ private:
 	// Linear-attention buffers
 	pod::TensorView qkv_buf_;
 	pod::TensorView conv_out_;    // [MAX_ROWS, channels] GDN conv output for prefill chunks
+	void* gdn_chunk_scratch_ = nullptr;   // GDN::recurrent_step_chunked scratch for prefill chunks
 	pod::TensorView z_buf_;
 	pod::TensorView gdn_gate_;
 	pod::TensorView gdn_beta_;

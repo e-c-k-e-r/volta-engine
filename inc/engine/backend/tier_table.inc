@@ -35,6 +35,8 @@ ENGINE_TIER_ENTRY( GDN, recurrent_step, Portable, "CPU: composed from the Slang 
 ENGINE_TIER_ENTRY( GDN, causal_conv1d_silu_rows, Portable, "" )
 ENGINE_TIER_ENTRY( GDN, causal_conv1d_silu_tiled, Portable, "" )
 ENGINE_TIER_ENTRY( GDN, recurrent_step_rows, Portable, "" )
+ENGINE_TIER_ENTRY( GDN, recurrent_step_chunked_scratch_bytes, Portable, "CPU, ROCm: 0 (no scratch)" )
+ENGINE_TIER_ENTRY( GDN, recurrent_step_chunked, Portable, "CPU, ROCm: the rows kernel; Vulkan: gdn_chunk.slang (FP32 on the shader cores)" )
 ENGINE_TIER_ENTRY( GDN, project_kda_gates, CudaSm70, "CPU: plain C++ reference (gdn_ref.cpp); Vulkan: glm.slang" )
 ENGINE_TIER_ENTRY( GDN, kda_journal_supported, CudaSm70, "CPU, Vulkan: false (the models keep per-row state snapshots)" )
 ENGINE_TIER_ENTRY( GDN, kda_journal_row_bytes, CudaSm70, "" )

@@ -108,6 +108,27 @@ void GDN::recurrent_step_rows(
 	impl::cpu_dispatch( ::recurrent_step_rows, &p, num_v_heads, 1, head_dim );
 }
 
+// The rows kernel: the prefill form needs no scratch here
+size_t GDN::recurrent_step_chunked_scratch_bytes( int, int, int ) { return 0; }
+
+void GDN::recurrent_step_chunked(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& gate,
+	const pod::TensorView& beta,
+	pod::TensorView& attn_out,
+	int num_k_heads,
+	int num_v_heads,
+	int head_dim,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	void*,
+	backend::stream_t stream
+) {
+	recurrent_step_rows( gdn_state, qkv, gate, beta, attn_out, num_k_heads, num_v_heads, head_dim, rows, d_rows, slot_stride, nullptr, 0, 0, nullptr, stream );
+}
+
 void GDN::gated_rmsnorm(
 	pod::TensorView& attn_out,
 	const pod::TensorView& z,

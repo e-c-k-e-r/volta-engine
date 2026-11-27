@@ -63,6 +63,7 @@ struct GatesParams { uint64_t norm_hidden, in_proj_a, in_proj_b, A_log, dt_bias,
 struct ConvRowsParams { uint64_t qkv, history, weights, slots, snap, snap_on; int channels, rows, snap_rows, has_weights; int64_t slot_stride, snap_stride; };
 struct ConvTiledParams { uint64_t src, dst, history, weights, slots; int channels, rows, tile_rows, has_weights; int64_t slot_stride; };
 struct RecurrentParams { uint64_t state, qkv, gate, beta, output, slots, snap, snap_on; int h_k, h_v, rows, snap_rows; float scale; int64_t slot_stride, snap_stride; };
+struct ChunkGdnParams { uint64_t qkv, gate, beta, state, slots, output, wu, pm, gam, s0, dd, pad; int h_k, h_v, rows; float scale; int64_t slot_stride; };
 struct GatedNormParams { uint64_t attn_out, z, norm_weight; int num_v_heads, head_dim, use_sigmoid, has_z, has_weight; };
 struct KvStoreParams { uint64_t data, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, ring; };
 struct NormRopeStoreParams {

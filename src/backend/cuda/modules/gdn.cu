@@ -3,6 +3,7 @@
 #include "engine/backend/cuda/reduce.cuh"
 #include "engine/runtime/options.h"
 #include <cuda_fp16.h>
+#include <mma.h>
 #include <cmath>
 
 namespace engine::modules {
@@ -10,6 +11,7 @@ namespace engine::modules {
 namespace {
 
 using engine::math::warp_sum;
+namespace wmma = nvcuda::wmma;
 
 __global__ void project_gates_kernel(
 	const half* __restrict__ norm_hidden,
@@ -1054,6 +1056,621 @@ kda_replay_kernel(
 	for ( int r = 0; r < 128; ++r ) st[r * 128 + c] = s[r];
 }
 
+
+// ---- Chunked delta rule (the prefill form) ----
+// Per v-head and 64-row chunk, with gamma_t the chunk's inclusive cumulative log decay and G_t = exp( gamma_t ), S0 the state entering
+// the chunk ([v][k]) and T = ( I + A )^-1, A_tj = beta_t exp( gamma_t - gamma_j ) k_t.k_j (j < t):
+//   Delta = U - W S0^T, W = T diag( beta G ) K, U = T diag( beta ) V      (the rows' deltas of the recurrence)
+//   S = G_last S0 + ( D Delta )^T K, D_j = exp( gamma_last - gamma_j )
+//   O = G Q S0^T + P Delta, P_tj = exp( gamma_t - gamma_j ) q_t.k_j (j <= t)
+// gdn_chunk_prep_kernel computes P, W, U and gamma of every chunk at once (T in 16 x 16 blocks); gdn_chunk_scan_kernel walks the chunks with a 32 x 128 tile of
+// the state in registers (the next chunk's operands loading meanwhile) and keeps each chunk's S0 and Delta; gdn_chunk_out_kernel then
+// computes O for every chunk at once. On the state's path a tensor-core product with an FP32 operand splits it into FP16 hi + lo (dropping
+// lo x lo), which keeps the recurrence near FP32; the output's products take FP16 operands (the output is FP16). A partial last chunk reads zero-padded copies of its K and Q rows (rows past the end count for nothing: beta, gate,
+// k, q and v are 0 there).
+constexpr int GC = 64;           // chunk rows
+constexpr int GKP = 136;         // shared pitch (halves) of 128-wide rows
+constexpr int GTP = 72;          // shared pitch (halves) of a 64 x 64 operand
+constexpr int GSV = 32;          // state rows (v) a scan block owns, and v columns an output block computes
+constexpr int GEP = 40;          // shared pitch (halves) of a 64 x 32 operand
+constexpr int GPP = 36;          // shared pitch (floats) of a 32-wide product
+constexpr int GQP = 144;         // shared pitch (halves) of the output block's Q rows (the P halves fit there after)
+constexpr size_t GSCAN_SMEM = 3 * GC * GKP * sizeof( half ) + 2 * GSV * GKP * sizeof( half ) + GC * GPP * sizeof( float ) + 2 * GSV * GTP * sizeof( half );
+constexpr size_t GPW = GC * GC + 2 * GC * 128;                                              // halves of P and W (hi, lo) per head and chunk
+constexpr size_t GSC = 128 * 128;                                                            // halves of S0
+constexpr size_t GDD = GC * 128;                                                             // halves of Delta
+static_assert( GC * GPP >= 8 * 256 && GC * GQP >= GC * GTP && 4 * 16 * GPP * sizeof( float ) >= GSV * GKP * sizeof( half ), "scan / output regions" );
+
+using AccF = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+using FragAR = wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major>;
+using FragBR = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major>;
+using FragBC = wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major>;
+
+__device__ __forceinline__ void split_hl( float x, half& hi, half& lo ) {
+	hi = __float2half_rn( x );
+	lo = __float2half_rn( x - __half2float( hi ) );
+}
+
+// Eight floats to two 16-byte stores of their FP16 hi and lo halves
+__device__ __forceinline__ void split8( const float* x, half* hi, half* lo ) {
+	alignas( 16 ) half h[8], l[8];
+	#pragma unroll
+	for ( int i = 0; i < 8; ++i ) split_hl( x[i], h[i], l[i] );
+	*reinterpret_cast<uint4*>( hi ) = *reinterpret_cast<const uint4*>( h );
+	*reinterpret_cast<uint4*>( lo ) = *reinterpret_cast<const uint4*>( l );
+}
+
+// Lower-triangle tile ( ti, tj ) of 10 (tj <= ti)
+__device__ __forceinline__ void tri_tile( int tile, int& ti, int& tj ) {
+	ti = 0;
+	while ( ( ti + 1 ) * ( ti + 2 ) / 2 <= tile ) ++ti;
+	tj = tile - ti * ( ti + 1 ) / 2;
+}
+
+// Scratch of one call: P and W (hi, lo) at pw + ( c * h_v + h ) * GPW, W then U (FP32) at uu + ( c * h_v + h ) * 2 * 64 * 128, gamma at gam + ( c * h_v + h ) * 64,
+// S0 at sc + ( c * h_v + h ) * GSC, Delta at dd + ( c * h_v + h ) * GDD, the padded K / Q of K head kh at pad + kh * 2 * 64 * 128
+struct ChunkScratch {
+	half* pw;
+	float* uu;
+	float* gam;
+	half* sc;
+	half* dd;
+	half* pad;
+};
+
+// One block per (v-head, chunk). The lower-triangular 64 x 64 matrices (A, T and T's scaled copies) live as their ten 16 x 16 blocks,
+// block ( i, j ) (j <= i) at index i ( i + 1 ) / 2 + j
+__device__ __forceinline__ int tri_index( int i, int j ) { return i * ( i + 1 ) / 2 + j; }
+
+__global__ void __launch_bounds__( 256, 2 ) gdn_chunk_prep_kernel(
+	const half* __restrict__ qkv,
+	const float* __restrict__ gate,
+	const float* __restrict__ beta,
+	ChunkScratch cs,
+	int h_k,
+	int h_v,
+	int rows
+) {
+	__shared__ __align__( 32 ) half s_r1[GC * GKP];                   // K, then V
+	__shared__ __align__( 32 ) unsigned char s_r2[GC * GKP * 2];      // Q, then A (blocks) and the solve's partial products, then T's scaled copy (hi, lo)
+	__shared__ __align__( 32 ) float s_r3[10 * 256];                  // per-warp product staging, then T (blocks)
+	__shared__ float s_g[GC], s_b[GC];
+	half* ks = s_r1;
+	half* vs = s_r1;
+	half* qs = reinterpret_cast<half*>( s_r2 );
+	float* fa = reinterpret_cast<float*>( s_r2 );
+	float* fm = fa + 10 * 256;
+	half* txh = reinterpret_cast<half*>( s_r2 );
+	half* txl = txh + 10 * 256;
+	float* ft = s_r3;
+	const int h = blockIdx.x, c = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+	const int ratio = h_v / h_k, kh = h / ratio;
+	const int r0 = c * GC, n = min( GC, rows - r0 );
+	const size_t stride = static_cast<size_t>( 2 * h_k + h_v ) * 128;
+	const size_t hc = static_cast<size_t>( c ) * h_v + h;
+	half* pw = cs.pw + hc * GPW;
+	const int er = lane >> 1, ec = ( lane & 1 ) * 8;   // a lane's 8 elements of a 16 x 16 tile
+
+	{
+		uint4 q[4], k[4];
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int x = tid + i * 256, t = x >> 4, v = ( x & 15 ) * 8;
+			q[i] = k[i] = make_uint4( 0, 0, 0, 0 );
+			if ( t < n ) {
+				const half* row = qkv + static_cast<size_t>( r0 + t ) * stride + kh * 128 + v;
+				q[i] = *reinterpret_cast<const uint4*>( row );
+				k[i] = *reinterpret_cast<const uint4*>( row + h_k * 128 );
+			}
+		}
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int x = tid + i * 256, t = x >> 4, v = ( x & 15 ) * 8;
+			*reinterpret_cast<uint4*>( qs + t * GKP + v ) = q[i];
+			*reinterpret_cast<uint4*>( ks + t * GKP + v ) = k[i];
+		}
+	}
+	if ( tid < GC ) {
+		const bool in = tid < n;
+		s_g[tid] = in ? gate[static_cast<size_t>( r0 + tid ) * h_v + h] : 0.0f;
+		s_b[tid] = in ? beta[static_cast<size_t>( r0 + tid ) * h_v + h] : 0.0f;
+	}
+	__syncthreads();
+	if ( tid == 0 ) {
+		float a = 0.0f;
+		for ( int t = 0; t < GC; ++t ) {
+			a += s_g[t];
+			s_g[t] = a;
+		}
+	}
+	if ( n < GC && h % ratio == 0 ) {
+		half* pk = cs.pad + static_cast<size_t>( kh ) * 2 * GC * 128;
+		for ( int i = tid; i < GC * 16; i += 256 ) {
+			const int t = i >> 4, v = ( i & 15 ) * 8;
+			*reinterpret_cast<uint4*>( pk + t * 128 + v ) = *reinterpret_cast<const uint4*>( ks + t * GKP + v );
+			*reinterpret_cast<uint4*>( pk + GC * 128 + t * 128 + v ) = *reinterpret_cast<const uint4*>( qs + t * GKP + v );
+		}
+	}
+	// P's tiles above the diagonal are zero
+	for ( int x = tid; x < 6 * 32; x += 256 ) {
+		const int tile = x >> 5, l = x & 31;
+		const int ti = tile < 3 ? 0 : tile < 5 ? 1 : 2, tj = tile < 3 ? tile + 1 : tile < 5 ? tile - 1 : 3;
+		*reinterpret_cast<uint4*>( pw + ( ti * 16 + ( l >> 1 ) ) * GC + tj * 16 + ( l & 1 ) * 8 ) = make_uint4( 0, 0, 0, 0 );
+	}
+	__syncthreads();
+
+	// P = exp( gamma_t - gamma_j ) q_t.k_j (j <= t) to the scratch, a tile at a time through the warp's staging
+	float* z = s_r3 + warp * 256;
+	for ( int tile = warp; tile < 10; tile += 8 ) {
+		int ti, tj;
+		tri_tile( tile, ti, tj );
+		AccF acc;
+		wmma::fill_fragment( acc, 0.0f );
+		#pragma unroll
+		for ( int kk = 0; kk < 8; ++kk ) {
+			FragAR a;
+			FragBC b;
+			wmma::load_matrix_sync( a, qs + ti * 16 * GKP + kk * 16, GKP );
+			wmma::load_matrix_sync( b, ks + tj * 16 * GKP + kk * 16, GKP );
+			wmma::mma_sync( acc, a, b, acc );
+		}
+		wmma::store_matrix_sync( z, acc, 16, wmma::mem_row_major );
+		__syncwarp();
+		const int t = ti * 16 + er;
+		alignas( 16 ) half ph[8];
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const int j = tj * 16 + ec + i;
+			ph[i] = __float2half_rn( j <= t ? expf( s_g[t] - s_g[j] ) * z[er * 16 + ec + i] : 0.0f );
+		}
+		*reinterpret_cast<uint4*>( pw + t * GC + tj * 16 + ec ) = *reinterpret_cast<const uint4*>( ph );
+		__syncwarp();
+	}
+	if ( tid < GC ) cs.gam[hc * GC + tid] = s_g[tid];
+	__syncthreads();
+
+	// A = beta_t exp( gamma_t - gamma_j ) k_t.k_j (j < t), into its blocks over Q
+	for ( int tile = warp; tile < 10; tile += 8 ) {
+		int ti, tj;
+		tri_tile( tile, ti, tj );
+		AccF acc;
+		wmma::fill_fragment( acc, 0.0f );
+		#pragma unroll
+		for ( int kk = 0; kk < 8; ++kk ) {
+			FragAR a;
+			FragBC b;
+			wmma::load_matrix_sync( a, ks + ti * 16 * GKP + kk * 16, GKP );
+			wmma::load_matrix_sync( b, ks + tj * 16 * GKP + kk * 16, GKP );
+			wmma::mma_sync( acc, a, b, acc );
+		}
+		wmma::store_matrix_sync( z, acc, 16, wmma::mem_row_major );
+		__syncwarp();
+		const int t = ti * 16 + er;
+		float* ab = fa + tile * 256 + er * 16 + ec;
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const int j = tj * 16 + ec + i;
+			ab[i] = j < t ? s_b[t] * expf( s_g[t] - s_g[j] ) * z[er * 16 + ec + i] : 0.0f;
+		}
+		__syncwarp();
+	}
+	__syncthreads();
+
+	// T = ( I + A )^-1 in 16 x 16 blocks: the diagonal blocks by forward substitution (a column a thread), then the blocks below them a
+	// diagonal at a time, T_ij = -T_ii sum_{j <= k < i} A_ik T_kj
+	if ( tid < GC ) {
+		const int bb = tid >> 4, col = tid & 15;
+		const float* ad = fa + tri_index( bb, bb ) * 256;
+		float x[16];
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) {
+			float s0 = 0.0f, s1 = 0.0f;
+			#pragma unroll
+			for ( int j = 0; j < i; ++j ) {
+				if ( j & 1 ) s1 = fmaf( ad[i * 16 + j], x[j], s1 );
+				else s0 = fmaf( ad[i * 16 + j], x[j], s0 );
+			}
+			x[i] = i < col ? 0.0f : i == col ? 1.0f : -( s0 + s1 );
+		}
+		float* td = ft + tri_index( bb, bb ) * 256;
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) td[i * 16 + col] = x[i];
+	}
+	__syncthreads();
+	for ( int d = 1; d < 4; ++d ) {
+		const int nb = 4 - d;
+		for ( int e = tid; e < nb * 256; e += 256 ) {
+			const int j = e >> 8, i = j + d, r = ( e >> 4 ) & 15, cc = e & 15;
+			float s0 = 0.0f, s1 = 0.0f;
+			for ( int k = j; k < i; ++k ) {
+				const float* ar = fa + tri_index( i, k ) * 256 + r * 16;
+				const float* tc = ft + tri_index( k, j ) * 256 + cc;
+				#pragma unroll
+				for ( int l = 0; l < 16; l += 2 ) {
+					s0 = fmaf( ar[l], tc[l * 16], s0 );
+					s1 = fmaf( ar[l + 1], tc[( l + 1 ) * 16], s1 );
+				}
+			}
+			fm[e] = s0 + s1;
+		}
+		__syncthreads();
+		for ( int e = tid; e < nb * 256; e += 256 ) {
+			const int j = e >> 8, i = j + d, r = ( e >> 4 ) & 15, cc = e & 15;
+			const float* tr = ft + tri_index( i, i ) * 256 + r * 16;
+			const float* mc = fm + j * 256 + cc;
+			float s0 = 0.0f, s1 = 0.0f;
+			#pragma unroll
+			for ( int l = 0; l < 16; l += 2 ) {
+				s0 = fmaf( tr[l], mc[l * 16], s0 );
+				s1 = fmaf( tr[l + 1], mc[( l + 1 ) * 16], s1 );
+			}
+			ft[tri_index( i, j ) * 256 + r * 16 + cc] = -( s0 + s1 );
+		}
+		__syncthreads();
+	}
+
+	// W = T diag( beta G ) K and U = T diag( beta ) V (FP32; T is lower triangular): warp w takes row tile w & 3, column tiles 4 ( w >> 2 ) ..
+	auto scale_t = [&]( bool with_g ) {
+		#pragma unroll
+		for ( int blk = 0; blk < 10; ++blk ) {
+			const int bj = blk == 0 ? 0 : blk < 3 ? blk - 1 : blk < 6 ? blk - 3 : blk - 6;   // tri_tile's column
+			const int e = blk * 256 + tid, j = bj * 16 + ( tid & 15 );
+			float x = ft[e] * s_b[j];
+			if ( with_g ) x *= expf( s_g[j] );
+			split_hl( x, txh[e], txl[e] );
+		}
+	};
+	const int rt = warp & 3, ct = ( warp >> 2 ) * 4;
+	auto product = [&]( const half* b_src, float* out ) {
+		for ( int tn = ct; tn < ct + 4; ++tn ) {
+			AccF acc;
+			wmma::fill_fragment( acc, 0.0f );
+			for ( int k = 0; k <= rt; ++k ) {
+				FragAR ah, al;
+				FragBR b;
+				wmma::load_matrix_sync( ah, txh + tri_index( rt, k ) * 256, 16 );
+				wmma::load_matrix_sync( al, txl + tri_index( rt, k ) * 256, 16 );
+				wmma::load_matrix_sync( b, b_src + k * 16 * GKP + tn * 16, GKP );
+				wmma::mma_sync( acc, ah, b, acc );
+				wmma::mma_sync( acc, al, b, acc );
+			}
+			wmma::store_matrix_sync( out + rt * 16 * 128 + tn * 16, acc, 128, wmma::mem_row_major );
+		}
+	};
+	float* wf = cs.uu + hc * 2 * GC * 128;
+	scale_t( true );
+	__syncthreads();
+	product( ks, wf );
+	__syncthreads();
+	scale_t( false );
+	for ( int i = tid; i < GC * 16; i += 256 ) {
+		const int t = i >> 4, v = ( i & 15 ) * 8;
+		uint4 x = make_uint4( 0, 0, 0, 0 );
+		if ( t < n ) x = *reinterpret_cast<const uint4*>( qkv + static_cast<size_t>( r0 + t ) * stride + ( 2 * h_k + h ) * 128 + v );
+		*reinterpret_cast<uint4*>( vs + t * GKP + v ) = x;
+	}
+	__syncthreads();
+	product( vs, wf + GC * 128 );
+	// W (written above by this block) to its hi / lo halves
+	half* wh = pw + GC * GC;
+	for ( int x = tid; x < GC * 128 / 8; x += 256 ) {
+		float w[8];
+		*reinterpret_cast<float4*>( w ) = *reinterpret_cast<const float4*>( wf + x * 8 );
+		*reinterpret_cast<float4*>( w + 4 ) = *reinterpret_cast<const float4*>( wf + x * 8 + 4 );
+		split8( w, wh + x * 8, wh + GC * 128 + x * 8 );
+	}
+}
+
+// One block per (v-head, 32 state rows): the chunks in order, the operands of the next chunk loading into registers meanwhile. Warp w holds
+// k columns 16 w .. 16 w + 15 of both 16-row halves of the state tile; for Delta it takes row tile w & 3 of v half w >> 2.
+__global__ void __launch_bounds__( 256, 1 ) gdn_chunk_scan_kernel(
+	float* __restrict__ state,
+	const half* __restrict__ qkv,
+	ChunkScratch cs,
+	int h_k,
+	int h_v,
+	int rows,
+	const pod::BatchRows* __restrict__ d_rows,
+	size_t slot_stride
+) {
+	extern __shared__ __align__( 32 ) unsigned char gdn_smem[];
+	half* s_wh = reinterpret_cast<half*>( gdn_smem );        // W (hi, lo), [t][k]
+	half* s_wl = s_wh + GC * GKP;
+	half* s_k = s_wl + GC * GKP;                              // K, [t][k]
+	half* s_sh = s_k + GC * GKP;                              // S0 (hi, lo), [v][k]
+	half* s_sl = s_sh + GSV * GKP;
+	float* s_p = reinterpret_cast<float*>( s_sl + GSV * GKP ); // W S0^T, then per-warp staging
+	half* s_eh = reinterpret_cast<half*>( s_p + GC * GPP );   // ( D Delta )^T (hi, lo), [v][t]
+	half* s_el = s_eh + GSV * GTP;
+	__shared__ float s_dt[2][GC], s_gl[2];
+	const int h = blockIdx.x, d0 = blockIdx.y * GSV, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+	const int ratio = h_v / h_k, kh = h / ratio, tr = warp & 3, ds = warp >> 2;
+	const size_t stride = static_cast<size_t>( 2 * h_k + h_v ) * 128;
+	const int chunks = ( rows + GC - 1 ) / GC;
+	float* st = state + static_cast<size_t>( d_rows->slot[0] ) * slot_stride + ( static_cast<size_t>( h ) * 128 + d0 ) * 128;
+	auto hcoff = [&]( int c ) { return static_cast<size_t>( c ) * h_v + h; };
+
+	uint4 rw[8], rk[4];
+	float4 ru[2];
+	const int ut = tid >> 2, uj = ( tid & 3 ) * 8;            // the thread's 8 elements of Delta
+	auto fetch_w = [&]( int c ) {
+		const half* w = cs.pw + hcoff( c ) * GPW + GC * GC;
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) rw[i] = *reinterpret_cast<const uint4*>( w + ( tid + i * 256 ) * 8 );
+	};
+	auto store_w = [&]() {
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const int x = ( tid + i * 256 ) * 8, m = x >> 13, o = ( ( x >> 7 ) & 63 ) * GKP + ( x & 127 );
+			*reinterpret_cast<uint4*>( ( m ? s_wl : s_wh ) + o ) = rw[i];
+		}
+	};
+	auto fetch_k = [&]( int c ) {
+		const int n = min( GC, rows - c * GC );
+		const half* kp = n < GC ? cs.pad + static_cast<size_t>( kh ) * 2 * GC * 128 : qkv + static_cast<size_t>( c * GC ) * stride + ( h_k + kh ) * 128;
+		const size_t ld = n < GC ? 128 : stride;
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int x = tid + i * 256;
+			rk[i] = *reinterpret_cast<const uint4*>( kp + ( x >> 4 ) * ld + ( x & 15 ) * 8 );
+		}
+	};
+	auto store_k = [&]() {
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int x = tid + i * 256;
+			*reinterpret_cast<uint4*>( s_k + ( x >> 4 ) * GKP + ( x & 15 ) * 8 ) = rk[i];
+		}
+	};
+	auto fetch_u = [&]( int c ) {
+		const float* u = cs.uu + hcoff( c ) * 2 * GC * 128 + GC * 128 + ut * 128 + d0 + uj;
+		ru[0] = *reinterpret_cast<const float4*>( u );
+		ru[1] = *reinterpret_cast<const float4*>( u + 4 );
+	};
+	auto scalars = [&]( int c, int b ) {
+		if ( tid < GC ) {
+			const float* g = cs.gam + hcoff( c ) * GC;
+			s_dt[b][tid] = expf( g[GC - 1] - g[tid] );
+			if ( tid == 0 ) s_gl[b] = expf( g[GC - 1] );
+		}
+	};
+	// The warp's columns of both state halves into s_sh / s_sl
+	AccF S[2];
+	auto split_state = [&]() {
+		float* z = s_p + warp * 256;
+		const int r = lane >> 1, k0 = warp * 16 + ( lane & 1 ) * 8;
+		#pragma unroll
+		for ( int f = 0; f < 2; ++f ) {
+			wmma::store_matrix_sync( z, S[f], 16, wmma::mem_row_major );
+			__syncwarp();
+			split8( z + r * 16 + ( lane & 1 ) * 8, s_sh + ( f * 16 + r ) * GKP + k0, s_sl + ( f * 16 + r ) * GKP + k0 );
+			__syncwarp();
+		}
+	};
+
+	#pragma unroll
+	for ( int f = 0; f < 2; ++f ) wmma::load_matrix_sync( S[f], st + f * 16 * 128 + warp * 16, 128, wmma::mem_row_major );
+	fetch_w( 0 );
+	fetch_k( 0 );
+	fetch_u( 0 );
+	split_state();
+	store_w();
+	scalars( 0, 0 );
+	__syncthreads();
+
+	for ( int c = 0; c < chunks; ++c ) {
+		const int b = c & 1, n = min( GC, rows - c * GC );
+		const size_t hc = hcoff( c );
+		// This chunk's S0 to the scratch (the output kernel's), its K into shared memory; the next chunk's W and K start loading
+		{
+			half* sc = cs.sc + hc * GSC + static_cast<size_t>( d0 ) * 128;
+			#pragma unroll
+			for ( int i = 0; i < 2; ++i ) {
+				const int x = tid + i * 256, r = x >> 4, v = ( x & 15 ) * 8;
+				*reinterpret_cast<uint4*>( sc + r * 128 + v ) = *reinterpret_cast<const uint4*>( s_sh + r * GKP + v );
+			}
+		}
+		store_k();
+		if ( c + 1 < chunks ) {
+			fetch_w( c + 1 );
+			fetch_k( c + 1 );
+		}
+
+		// W S0^T, row tile tr of v half ds
+		{
+			AccF a1, a2, a3;
+			wmma::fill_fragment( a1, 0.0f );
+			wmma::fill_fragment( a2, 0.0f );
+			wmma::fill_fragment( a3, 0.0f );
+			#pragma unroll
+			for ( int kk = 0; kk < 8; ++kk ) {
+				FragAR ah, al;
+				FragBC bh, bl;
+				wmma::load_matrix_sync( ah, s_wh + tr * 16 * GKP + kk * 16, GKP );
+				wmma::load_matrix_sync( al, s_wl + tr * 16 * GKP + kk * 16, GKP );
+				wmma::load_matrix_sync( bh, s_sh + ds * 16 * GKP + kk * 16, GKP );
+				wmma::load_matrix_sync( bl, s_sl + ds * 16 * GKP + kk * 16, GKP );
+				wmma::mma_sync( a1, ah, bh, a1 );
+				wmma::mma_sync( a2, ah, bl, a2 );
+				wmma::mma_sync( a3, al, bh, a3 );
+			}
+			#pragma unroll
+			for ( int i = 0; i < a1.num_elements; ++i ) a1.x[i] += a2.x[i] + a3.x[i];
+			wmma::store_matrix_sync( s_p + tr * 16 * GPP + ds * 16, a1, GPP, wmma::mem_row_major );
+		}
+		__syncthreads();
+
+		// Delta = U - W S0^T (to the scratch, hi / lo) and D Delta (hi / lo); the next chunk's W into shared memory, its U loading
+		{
+			float dv[8];
+			const float* u = reinterpret_cast<const float*>( ru );
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) dv[i] = ut < n ? u[i] - s_p[ut * GPP + uj + i] : 0.0f;
+			alignas( 16 ) half dh[8];
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) dh[i] = __float2half_rn( dv[i] );
+			*reinterpret_cast<uint4*>( cs.dd + hc * GDD + ut * 128 + d0 + uj ) = *reinterpret_cast<const uint4*>( dh );
+			const float dt = s_dt[b][ut];
+			#pragma unroll
+			for ( int i = 0; i < 8; ++i ) split_hl( dv[i] * dt, s_eh[( uj + i ) * GTP + ut], s_el[( uj + i ) * GTP + ut] );
+		}
+		if ( c + 1 < chunks ) {
+			store_w();
+			fetch_u( c + 1 );
+		}
+		__syncthreads();
+
+		// S = G_last S0 + ( D Delta )^T K over the warp's 16 k columns
+		{
+			const float gl = s_gl[b];
+			#pragma unroll
+			for ( int f = 0; f < 2; ++f ) {
+				#pragma unroll
+				for ( int i = 0; i < S[f].num_elements; ++i ) S[f].x[i] *= gl;
+			}
+			#pragma unroll
+			for ( int k = 0; k < 4; ++k ) {
+				FragBR kf;
+				wmma::load_matrix_sync( kf, s_k + k * 16 * GKP + warp * 16, GKP );
+				#pragma unroll
+				for ( int f = 0; f < 2; ++f ) {
+					FragAR eh, el;
+					wmma::load_matrix_sync( eh, s_eh + f * 16 * GTP + k * 16, GTP );
+					wmma::load_matrix_sync( el, s_el + f * 16 * GTP + k * 16, GTP );
+					wmma::mma_sync( S[f], eh, kf, S[f] );
+					wmma::mma_sync( S[f], el, kf, S[f] );
+				}
+			}
+			split_state();
+		}
+		if ( c + 1 < chunks ) scalars( c + 1, b ^ 1 );
+		__syncthreads();
+	}
+	#pragma unroll
+	for ( int f = 0; f < 2; ++f ) wmma::store_matrix_sync( st + f * 16 * 128 + warp * 16, S[f], 128, wmma::mem_row_major );
+}
+
+// One block per (v-head, chunk, 32 v columns): O = G Q S0^T + P Delta, rows of the chunk to the output
+__global__ void __launch_bounds__( 128 ) gdn_chunk_out_kernel(
+	const half* __restrict__ qkv,
+	ChunkScratch cs,
+	half* __restrict__ output,
+	int h_k,
+	int h_v,
+	float scale,
+	int rows
+) {
+	__shared__ __align__( 32 ) half s_x[GC * GQP];               // Q [t][k], then P [t][j]
+	__shared__ __align__( 32 ) float s_s[4 * 16 * GPP];          // S0 [v][k] (halves), then per-warp staging
+	__shared__ __align__( 32 ) half s_d[GC * GEP];               // Delta [t][v]
+	const int h = blockIdx.x, c = blockIdx.y, v0 = blockIdx.z * GSV, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, r16 = warp * 16;
+	const int ratio = h_v / h_k, kh = h / ratio;
+	const int r0 = c * GC, n = min( GC, rows - r0 );
+	const size_t stride = static_cast<size_t>( 2 * h_k + h_v ) * 128;
+	const size_t hc = static_cast<size_t>( c ) * h_v + h;
+	const half* qp = n < GC ? cs.pad + static_cast<size_t>( kh ) * 2 * GC * 128 + GC * 128 : qkv + static_cast<size_t>( r0 ) * stride + kh * 128;
+	const size_t ld = n < GC ? 128 : stride;
+	const half* pw = cs.pw + hc * GPW;
+	const half* sc = cs.sc + hc * GSC + static_cast<size_t>( v0 ) * 128;
+	const half* dd = cs.dd + hc * GDD + v0;
+	half* ss = reinterpret_cast<half*>( s_s );
+	uint4 rp[4];
+	{
+		uint4 rq[8], rs[4], rd[2];
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const int x = tid + i * 128;
+			rq[i] = *reinterpret_cast<const uint4*>( qp + ( x >> 4 ) * ld + ( x & 15 ) * 8 );
+		}
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int x = tid + i * 128;
+			rs[i] = *reinterpret_cast<const uint4*>( sc + ( x >> 4 ) * 128 + ( x & 15 ) * 8 );
+			rp[i] = *reinterpret_cast<const uint4*>( pw + ( x >> 3 ) * GC + ( x & 7 ) * 8 );
+		}
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			const int x = tid + i * 128;
+			rd[i] = *reinterpret_cast<const uint4*>( dd + ( x >> 2 ) * 128 + ( x & 3 ) * 8 );
+		}
+		#pragma unroll
+		for ( int i = 0; i < 8; ++i ) {
+			const int x = tid + i * 128;
+			*reinterpret_cast<uint4*>( s_x + ( x >> 4 ) * GQP + ( x & 15 ) * 8 ) = rq[i];
+		}
+		#pragma unroll
+		for ( int i = 0; i < 4; ++i ) {
+			const int x = tid + i * 128;
+			*reinterpret_cast<uint4*>( ss + ( x >> 4 ) * GKP + ( x & 15 ) * 8 ) = rs[i];
+		}
+		#pragma unroll
+		for ( int i = 0; i < 2; ++i ) {
+			const int x = tid + i * 128;
+			*reinterpret_cast<uint4*>( s_d + ( x >> 2 ) * GEP + ( x & 3 ) * 8 ) = rd[i];
+		}
+	}
+	__syncthreads();
+
+	AccF o[2];
+	#pragma unroll
+	for ( int s = 0; s < 2; ++s ) wmma::fill_fragment( o[s], 0.0f );
+	#pragma unroll
+	for ( int kk = 0; kk < 8; ++kk ) {
+		FragAR a;
+		wmma::load_matrix_sync( a, s_x + r16 * GQP + kk * 16, GQP );
+		#pragma unroll
+		for ( int s = 0; s < 2; ++s ) {
+			FragBC b;
+			wmma::load_matrix_sync( b, ss + ( s * 16 ) * GKP + kk * 16, GKP );
+			wmma::mma_sync( o[s], a, b, o[s] );
+		}
+	}
+	__syncthreads();
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) {
+		const int x = tid + i * 128;
+		*reinterpret_cast<uint4*>( s_x + ( x >> 3 ) * GTP + ( x & 7 ) * 8 ) = rp[i];
+	}
+	// G Q S0^T, row-scaled in the warp's staging, becomes the accumulator P Delta adds to
+	float* z = s_s + warp * 16 * GPP;
+	#pragma unroll
+	for ( int s = 0; s < 2; ++s ) wmma::store_matrix_sync( z + s * 16, o[s], GPP, wmma::mem_row_major );
+	__syncwarp();
+	const float* g = cs.gam + hc * GC;
+	const int er = lane >> 1, ec = ( lane & 1 ) * 16;
+	{
+		const float gt = expf( g[r16 + er] );
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) z[er * GPP + ec + i] *= gt;
+	}
+	__syncwarp();
+	#pragma unroll
+	for ( int s = 0; s < 2; ++s ) wmma::load_matrix_sync( o[s], z + s * 16, GPP, wmma::mem_row_major );
+	__syncthreads();
+	for ( int k = 0; k <= warp; ++k ) {
+		FragAR a;
+		wmma::load_matrix_sync( a, s_x + r16 * GTP + k * 16, GTP );
+		#pragma unroll
+		for ( int s = 0; s < 2; ++s ) {
+			FragBR b;
+			wmma::load_matrix_sync( b, s_d + k * 16 * GEP + s * 16, GEP );
+			wmma::mma_sync( o[s], a, b, o[s] );
+		}
+	}
+	#pragma unroll
+	for ( int s = 0; s < 2; ++s ) wmma::store_matrix_sync( z + s * 16, o[s], GPP, wmma::mem_row_major );
+	__syncwarp();
+	const int t = r16 + er;
+	if ( t < n ) {
+		alignas( 16 ) half out[16];
+		#pragma unroll
+		for ( int i = 0; i < 16; ++i ) out[i] = __float2half_rn( z[er * GPP + ec + i] * scale );
+		half* op = output + static_cast<size_t>( r0 + t ) * h_v * 128 + h * 128 + v0 + ec;
+		*reinterpret_cast<uint4*>( op ) = *reinterpret_cast<const uint4*>( out );
+		*reinterpret_cast<uint4*>( op + 8 ) = *reinterpret_cast<const uint4*>( out + 8 );
+	}
+}
+
 } // namespace
 
 void GDN::project_gates(
@@ -1232,6 +1849,61 @@ void GDN::recurrent_step_rows(
 		gdn_state, qkv.ptr<const half>(), gate.ptr<const float>(), beta.ptr<const float>(), attn_out.ptr<half>(),
 		num_k_heads, num_v_heads, scale, rows, d_rows, slot_stride, snap, snap_stride, snap_rows, snap_on
 	);
+}
+
+// ROCm: the rows kernel (the scan kernel's shared memory is above RDNA's 64 KB a workgroup)
+size_t GDN::recurrent_step_chunked_scratch_bytes( int rows, int num_k_heads, int num_v_heads ) {
+#if defined(USE_ROCM)
+	return 0;
+#endif
+	const size_t hc = static_cast<size_t>( rows + GC - 1 ) / GC * num_v_heads;
+	return hc * ( ( GPW + GSC + GDD ) * sizeof( half ) + ( 2 * GC * 128 + GC ) * sizeof( float ) ) + static_cast<size_t>( num_k_heads ) * 2 * GC * 128 * sizeof( half );
+}
+
+void GDN::recurrent_step_chunked(
+	float* gdn_state,
+	const pod::TensorView& qkv,
+	const pod::TensorView& gate,
+	const pod::TensorView& beta,
+	pod::TensorView& attn_out,
+	int num_k_heads,
+	int num_v_heads,
+	int head_dim,
+	int rows,
+	const pod::BatchRows* d_rows,
+	size_t slot_stride,
+	void* scratch,
+	cudaStream_t stream
+) {
+#if defined(USE_ROCM)
+	recurrent_step_rows( gdn_state, qkv, gate, beta, attn_out, num_k_heads, num_v_heads, head_dim, rows, d_rows, slot_stride, nullptr, 0, 0, nullptr, stream );
+	return;
+#endif
+	ENGINE_ASSERT( head_dim == 128, "GDN::recurrent_step_chunked: the kernels are specialized for head_dim 128" );
+	ENGINE_ASSERT( num_v_heads % num_k_heads == 0, "GDN::recurrent_step_chunked: v heads must be a multiple of k heads" );
+	const int chunks = ( rows + GC - 1 ) / GC;
+	const size_t hc = static_cast<size_t>( chunks ) * num_v_heads;
+	ChunkScratch cs;
+	cs.pw = static_cast<half*>( scratch );
+	cs.sc = cs.pw + hc * GPW;
+	cs.dd = cs.sc + hc * GSC;
+	cs.pad = cs.dd + hc * GDD;
+	cs.uu = reinterpret_cast<float*>( cs.pad + static_cast<size_t>( num_k_heads ) * 2 * GC * 128 );
+	cs.gam = cs.uu + hc * 2 * GC * 128;
+	static bool attr[ENGINE_NUM_GPUS] = {};
+	int dev = 0;
+	cudaGetDevice( &dev );
+	if ( !attr[dev] ) {
+		CUDA_CHECK( cudaFuncSetAttribute( gdn_chunk_scan_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>( GSCAN_SMEM ) ) );
+		CUDA_CHECK( cudaFuncSetAttribute( gdn_chunk_prep_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100 ) );
+		CUDA_CHECK( cudaFuncSetAttribute( gdn_chunk_out_kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100 ) );
+		attr[dev] = true;
+	}
+	const half* q = qkv.ptr<const half>();
+	gdn_chunk_prep_kernel<<<dim3( num_v_heads, chunks ), 256, 0, stream>>>( q, gate.ptr<const float>(), beta.ptr<const float>(), cs, num_k_heads, num_v_heads, rows );
+	gdn_chunk_scan_kernel<<<dim3( num_v_heads, 128 / GSV ), 256, GSCAN_SMEM, stream>>>( gdn_state, q, cs, num_k_heads, num_v_heads, rows, d_rows, slot_stride );
+	gdn_chunk_out_kernel<<<dim3( num_v_heads, chunks, 128 / GSV ), 128, 0, stream>>>( q, cs, attn_out.ptr<half>(), num_k_heads, num_v_heads,
+		1.0f / sqrtf( static_cast<float>( head_dim ) ), rows );
 }
 
 void GDN::causal_conv1d_silu_tiled(

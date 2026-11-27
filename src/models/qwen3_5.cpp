@@ -123,6 +123,8 @@ bool Qwen3_5Pipeline::init(
 	{
 		int conv_shape[2] = { R, lin_channels };
 		conv_out_ = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, conv_shape, 2 );   // prefill conv output
+		const size_t chunk_bytes = engine::modules::GDN::recurrent_step_chunked_scratch_bytes( R, lin_k_heads_, lin_v_heads );
+		if ( chunk_bytes > 0 ) gdn_chunk_scratch_ = engine::core::arena_alloc( arena, chunk_bytes );
 	}
 
 	int z_shape[2] = { R, lin_v_heads * config_.linear_head_dim };
@@ -847,12 +849,18 @@ void Qwen3_5Pipeline::layer_forward( const Qwen3_5LayerWeights& lw, int& full_at
 			gate_rows, beta_rows, v_heads, config_.hidden_size, stream, m
 		);
 
-		// GDN recurrent step: advances state causally
-		engine::modules::GDN::recurrent_step_rows(
-			layer_gdn_state, qkv_rows, gate_rows, beta_rows, out_rows,
-			k_heads, v_heads, config_.linear_head_dim, m, d_rows_, state_.slot_gdn_floats,
-			gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream
-		);
+		// GDN recurrent step: advances state causally (prefill chunks: the chunked form)
+		if ( m > pod::MAX_BATCH && runtime::options().gdn_chunked ) {
+			engine::modules::GDN::recurrent_step_chunked( layer_gdn_state, qkv_rows, gate_rows, beta_rows, out_rows, k_heads, v_heads,
+				config_.linear_head_dim, m, d_rows_, state_.slot_gdn_floats, gdn_chunk_scratch_, stream );
+		}
+		else {
+			engine::modules::GDN::recurrent_step_rows(
+				layer_gdn_state, qkv_rows, gate_rows, beta_rows, out_rows,
+				k_heads, v_heads, config_.linear_head_dim, m, d_rows_, state_.slot_gdn_floats,
+				gdn_snap, state_.slot_gdn_floats, snap_rows, state_.d_snap_on, stream
+			);
+		}
 
 		// Gated RMSNorm: gdn_out * rsqrt * norm_weight * silu(z)
 		engine::modules::GDN::gated_rmsnorm(

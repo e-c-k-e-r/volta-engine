@@ -1,6 +1,6 @@
 // Op-level cross-backend golden test for the attention side of the module API: attention decode / prefill (GQA 24/4 x 256, gate),
 // Q/gate unpack, MLA latent (absorb_q, store, attend dense and DSA-selected, expand_out), mHC collapse + update, DSA (project, score,
-// select) and the GDN / KDA single-row and row forms. ONE source builds in the CUDA configuration (--dump runs the real CUDA kernels
+// select) and the GDN / KDA single-row, row and chunked prefill forms. ONE source builds in the CUDA configuration (--dump runs the real CUDA kernels
 // and writes golden files) and in the CPU configuration (--check recomputes with the CPU backend and compares); --check also
 // passes in the CUDA build against its own dump. Inputs come from GoldenRng fixed seeds, so nothing but outputs is stored.
 //   test_ops_attention --dump <dir> | --check <dir>
@@ -576,6 +576,56 @@ void test_gdn( bool single_row_only ) {
 	}
 }
 
+// ---- GDN prefill form: the chunked delta rule against the rows kernel (4 full chunks and a partial one, slot 1 of 2, GQA 4 / 12), with the
+// model's range of decay and with a slow decay that carries the state across every chunk ----
+void test_gdn_chunked() {
+	std::printf( "GDN chunked prefill\n" );
+	GoldenRng rng( 5006 );
+	const int hk = 4, hv = 12, hd = 128, rows = 300, slots = 2, channels = ( 2 * hk + hv ) * hd;
+	const size_t state_stride = static_cast<size_t>( hv ) * hd * hd, out_n = static_cast<size_t>( rows ) * hv * hd;
+	auto run = [&]( float gate_spread, const std::string& name ) {
+		// q and k unit-length per head, as l2_norm_heads leaves them; v and beta in the model's ranges
+		std::vector<half_t> qkv( static_cast<size_t>( rows ) * channels );
+		for ( int r = 0; r < rows; ++r ) {
+			for ( int hh = 0; hh < 2 * hk + hv; ++hh ) {
+				float x[128], ss = 0.0f;
+				for ( int i = 0; i < hd; ++i ) {
+					x[i] = rng.uniform( 1.0f );
+					ss += x[i] * x[i];
+				}
+				const float sc = hh < 2 * hk ? 1.0f / std::sqrt( ss ) : 0.5f;
+				for ( int i = 0; i < hd; ++i ) qkv[static_cast<size_t>( r ) * channels + hh * hd + i] = backend::from_float_half( x[i] * sc );
+			}
+		}
+		std::vector<float> gate( static_cast<size_t>( rows ) * hv ), beta( static_cast<size_t>( rows ) * hv );
+		for ( auto& g : gate ) g = -0.01f - std::fabs( rng.uniform( gate_spread ) );
+		for ( auto& b : beta ) b = 0.5f + rng.uniform( 0.45f );
+		const std::vector<float> state = rf( rng, state_stride * slots, 0.1f );
+		std::vector<int> sl( rows, 1 ), ps( rows );
+		for ( int r = 0; r < rows; ++r ) ps[r] = r;
+		pod::BatchRows* drows = up_rows( pod::BatchRows::batched( rows, sl.data(), ps.data() ) );
+		float* dstate = up( state );
+		float* dstate_rows = up( state );
+		half_t* dout = zeros<half_t>( out_n );
+		half_t* dout_rows = zeros<half_t>( out_n );
+		void* scratch = zeros<unsigned char>( std::max<size_t>( GDN::recurrent_step_chunked_scratch_bytes( rows, hk, hv ), 16 ) );
+		pod::TensorView tq = tv( up( qkv ), pod::DType::FP16, rows, channels ), tg = tv( up( gate ), pod::DType::FP32, rows, hv );
+		pod::TensorView tb = tv( up( beta ), pod::DType::FP32, rows, hv ), to = tv( dout, pod::DType::FP16, rows, hv * hd ), tor = tv( dout_rows, pod::DType::FP16, rows, hv * hd );
+		GDN::recurrent_step_chunked( dstate, tq, tg, tb, to, hk, hv, hd, rows, drows, state_stride, scratch, nullptr );
+		GDN::recurrent_step_rows( dstate_rows, tq, tg, tb, tor, hk, hv, hd, rows, drows, state_stride, nullptr, 0, 0, nullptr, nullptr );
+		backend::device_sync();
+		const auto out = dl( dout, out_n ), st = dlf( dstate + state_stride, state_stride );
+		g_cases += 3;
+		if ( !golden_compare( ( name + " vs rows: out" ).c_str(), dl( dout_rows, out_n ), out, 0.99999, 0.002 ) ) ++g_fail;
+		if ( !golden_compare( ( name + " vs rows: state" ).c_str(), dlf( dstate_rows + state_stride, state_stride ), st, 0.99999, 0.002 ) ) ++g_fail;
+		if ( !golden_compare( ( name + ": slot 0 kept" ).c_str(), std::vector<float>( state.begin(), state.begin() + state_stride ), dlf( dstate, state_stride ), 1.0, 0.0 ) ) ++g_fail;
+		emit( ( name + "_out" ).c_str(), out );
+		emit( ( name + "_state" ).c_str(), st );
+	};
+	run( 0.3f, "gdn_chunked" );
+	run( 0.01f, "gdn_chunked_slow" );
+}
+
 }
 
 int main( int argc, char** argv ) {
@@ -587,7 +637,7 @@ int main( int argc, char** argv ) {
 	}
 	backend::set_device( 0 );
 	std::printf( "test_ops_attention (%s, dir %s)\n", args.dump ? "dump" : "check", args.dir.c_str() );
-	// `--only <name>[,<name>...]` runs a subset of {attention, kvq, latent, latentq, dsa, mhc, gdn, gdn_single} (a backend that lacks some modules)
+	// `--only <name>[,<name>...]` runs a subset of {attention, kvq, latent, latentq, dsa, mhc, gdn, gdn_single, gdn_chunked} (a backend that lacks some modules)
 	std::string only;
 	for ( int i = 1; i + 1 < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--only" ) ) only = std::string( "," ) + argv[i + 1] + ",";
@@ -609,6 +659,7 @@ int main( int argc, char** argv ) {
 	if ( want( "mhc" ) ) test_mhc();
 	if ( want( "gdn" ) ) test_gdn( false );
 	if ( want( "gdn_single" ) ) test_gdn( true );
+	if ( want( "gdn_chunked" ) ) test_gdn_chunked();
 	backend::device_sync();
 	for ( void* p : g_allocs ) backend::device_free( p );
 	std::printf( "%d outputs, %d failures\n", g_cases, g_fail );
