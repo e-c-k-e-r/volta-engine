@@ -516,6 +516,8 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	using namespace ::engine::modules;
 	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
 	if ( k % 32 != 0 || k_split % 32 != 0 || !aligned( w ) || !aligned( x ) || !aligned( out ) ) return false;
+	// the tensor cores where the device has a path to them (the same output and slab layout)
+	if ( cuda_gemm_tn( w, x, out, m, n, k, f32_out, k_split > 0 && k_split < k ? k_split : 0, stream ) ) return true;
 	if ( k_split <= 0 || k_split > k ) k_split = k;
 	const uint32_t splits = static_cast<uint32_t>( ( k + k_split - 1 ) / k_split );
 	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
@@ -553,6 +555,7 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 // FP16 out = x * w^T, a long K over few output tiles split into slabs that keep about kTiles workgroups busy, their FP32 partials summed in
 // order (trellis.slang's trellis_split_sum; scratch slot 3)
 bool ggml_f16_matmul_split( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream ) {
+	if ( cuda_gemm_tn( w, x, out, m, n, k, false, 0, stream ) ) return true;   // the tensor cores split along k themselves
 	constexpr int kTiles = 160;
 	const int tiles_mn = ( ( m + 63 ) / 64 ) * ( ( n + 63 ) / 64 );
 	if ( tiles_mn >= kTiles || k < 2048 ) return ggml_f16_matmul( w, x, out, m, n, k, false, stream );

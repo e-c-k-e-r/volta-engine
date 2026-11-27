@@ -304,6 +304,20 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	else()
 		message(STATUS "glslc not found: the Vulkan GGUF projections run on the Slang kernels alone")
 	endif()
+	# The CUDA backend's FP16 tensor-core GEMM as PTX for the launches through VK_NV_cuda_kernel_launch (NVIDIA GPUs without cooperative
+	# matrices: Volta; src/backend/vulkan/mod_cuda.cpp), where nvcc is found
+	find_program(ENGINE_NVCC nvcc HINTS /opt/cuda/bin /usr/local/cuda/bin ENV CUDA_PATH PATH_SUFFIXES bin)
+	if(ENGINE_NVCC)
+		set(sout ${SLANG_OUT}/cuda_gemm.ptx)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${ENGINE_NVCC} -arch=compute_70 -ptx -std=c++17 -O3 --expt-relaxed-constexpr -Wno-deprecated-gpu-targets -diag-suppress 177
+				${PROJECT_SOURCE_DIR}/src/kernels/cuda/gemm/gemm_f16_vk.cu -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/cuda/gemm/gemm_f16_vk.cu ${PROJECT_SOURCE_DIR}/src/kernels/cuda/gemm/gemm_f16_kernel.cuh
+			COMMENT "nvcc gemm_f16_vk -> ptx")
+		list(APPEND VK_FLASH_SPV ${sout})
+	else()
+		message(STATUS "nvcc not found: on NVIDIA GPUs without cooperative matrices the Vulkan GEMMs stay on the shader cores")
+	endif()
 	add_custom_target(flash_spv DEPENDS ${VK_FLASH_SPV})
 	add_dependencies(slang_kernels flash_spv)
 

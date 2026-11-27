@@ -77,4 +77,19 @@ void scratch_use( stream_t s );
 // its allocation
 void dispatch_bound( stream_t s, Pipeline* p, const void* push, const void* const* buffers, uint32_t gx, uint32_t gy = 1, uint32_t gz = 1 );
 
+// CUDA kernels on NVIDIA devices (VK_NV_cuda_kernel_launch, enabled where the device has it and the option vk_cuda_launch allows): PTX
+// modules whose kernels take device pointers as they are, recorded into a stream like dispatches (the same barriers, graph capture and
+// vulkan_profile rows). A launch has at most 48 KiB of shared memory.
+struct CudaFunction;
+bool cuda_launch_available();
+// Kernel `name` (an extern "C" entry) of the PTX module at ptx_path (the library's embedded copy by the file's name first, as for SPIR-V),
+// loaded once per device; nullptr where unavailable
+CudaFunction* cuda_function( const char* ptx_path, const char* name );
+// Record fn over grid (gx, gy, gz) of blocks (bx, by, bz) with smem bytes of dynamic shared memory; params[i] points at argument i's value
+// (read while recording)
+void cuda_launch( stream_t s, CudaFunction* fn, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t bx, uint32_t by, uint32_t bz, uint32_t smem,
+	const void* const* params, uint32_t nparams );
+// The device's streaming multiprocessors (VK_NV_shader_sm_builtins), 0 where unknown
+uint32_t sm_count();
+
 } // namespace engine::backend::vk

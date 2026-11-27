@@ -60,8 +60,9 @@ auto engine = volta::Engine::create( config_json, &error );   // or ( config_jso
   1.3 structs and the single-feature ones) and `enabled_extensions`. The device must have every feature the engine enables on a device of
   its own where the GPU supports it: `bufferDeviceAddress`, `shaderFloat16`, `timelineSemaphore`, `shaderInt64`, `shaderInt16`,
   `shaderFloat64`, `shaderInt8`, 16- and 8-bit storage, and `subgroupSizeControl` on GPUs whose subgroups are not 32 wide. The engine uses
-  `VK_KHR_push_descriptor`, `VK_EXT_external_memory_host`, `VK_EXT_memory_budget`, `VK_KHR_shader_integer_dot_product` and
-  `VK_EXT_subgroup_size_control` when they are enabled. A device that lacks a required feature is refused with an error naming it. The
+  `VK_KHR_push_descriptor`, `VK_EXT_external_memory_host`, `VK_EXT_memory_budget`, `VK_KHR_shader_integer_dot_product`,
+  `VK_EXT_subgroup_size_control` and `VK_NV_cuda_kernel_launch` (with its `cudaKernelLaunchFeatures`: the tensor-core GEMM on Volta) when they
+  are enabled. A device that lacks a required feature is refused with an error naming it. The
   host's device is the only one: `tp_size` 1 and `tts.device` 0.
 
 The arena is sized from the memory the device reports free (`VK_EXT_memory_budget`), so what the host has already allocated is left alone.

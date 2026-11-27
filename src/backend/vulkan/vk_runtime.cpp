@@ -3,10 +3,13 @@
 // long as each stream is used by one thread at a time.
 #include "engine/backend/vulkan/device.h"
 
+// VK_NV_cuda_kernel_launch is a provisional extension (vulkan_beta.h)
+#define VK_ENABLE_BETA_EXTENSIONS
 #include <vulkan/vulkan.h>
 
 #include "engine/runtime/options.h"
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -70,6 +73,14 @@ struct Ctx {
 	bool qreset = true;
 	std::vector<const vk::Pipeline*> qwho;
 	bool rte16 = false;   // shaderRoundingModeRTEFloat16: float -> half conversions can be made round-to-nearest-even
+	// VK_NV_cuda_kernel_launch: CUDA modules by name (a failed one null), their functions by "module:name" (a missing one null)
+	bool cuda = false;
+	uint32_t sm_count = 0;   // VK_NV_shader_sm_builtins' shaderSMCount (0: unknown)
+	PFN_vkCreateCudaModuleNV cuda_create_module = nullptr;
+	PFN_vkCreateCudaFunctionNV cuda_create_function = nullptr;
+	PFN_vkCmdCudaLaunchKernelNV cuda_cmd_launch = nullptr;
+	std::map<std::string, VkCudaModuleNV> cuda_modules;
+	std::map<std::string, vk::CudaFunction*> cuda_functions;
 	// Shared by the threads that use the device (a language model's and the TTS's, say): the allocation table and the staging pool are taken
 	// under mu; every stream records into command buffers of its own pool, so threads on different streams never share a pool
 	std::mutex mu;
@@ -164,6 +175,11 @@ struct Pipeline {
 	uint32_t push_bytes = 0, buffers = 0;
 	std::string name;   // its .spv file's name (vulkan_profile's rows)
 };
+// A CUDA kernel of a loaded module; prof names its vulkan_profile rows
+struct CudaFunction {
+	VkCudaFunctionNV fn = VK_NULL_HANDLE;
+	Pipeline prof;
+};
 } // namespace vk
 
 namespace {
@@ -209,7 +225,7 @@ bool init_instance() {
 // single-feature ones) the backend looks at, and its extensions
 struct Enabled {
 	bool int64 = false, int16 = false, float64 = false, sb16 = false, usb16 = false, bda = false, fp16 = false, timeline = false, int8 = false, sb8 = false;
-	bool dot = false, sg_ctl = false;
+	bool dot = false, sg_ctl = false, cuda = false;
 	std::vector<std::string> exts;
 	bool has( const char* e ) const {
 		for ( const auto& x : exts ) {
@@ -272,6 +288,9 @@ Enabled enabled_of( const vk::HostDevice& h ) {
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES: {
 				e.sg_ctl = e.sg_ctl || reinterpret_cast<const VkPhysicalDeviceSubgroupSizeControlFeatures*>( b )->subgroupSizeControl;
 			} break;
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV: {
+				e.cuda = e.cuda || reinterpret_cast<const VkPhysicalDeviceCudaKernelLaunchFeaturesNV*>( b )->cudaKernelLaunchFeatures;
+			} break;
 			default: break;
 		}
 	}
@@ -303,6 +322,7 @@ bool init_context( int dev ) {
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
 	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false, has_budget = false, has_sg_ctl = false;
+	bool has_cuda = false, has_sm_builtins = false;
 	{
 		uint32_t en = 0;
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
@@ -316,8 +336,12 @@ bool init_context( int dev ) {
 			has_mem_fd = has_mem_fd || std::strcmp( e.extensionName, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME ) == 0;
 			has_budget = has_budget || std::strcmp( e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME ) == 0;
 			has_sg_ctl = has_sg_ctl || std::strcmp( e.extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME ) == 0;
+			has_cuda = has_cuda || std::strcmp( e.extensionName, VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME ) == 0;
+			has_sm_builtins = has_sm_builtins || std::strcmp( e.extensionName, VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME ) == 0;
 		}
 	}
+	// the CUDA launches unless vk_cuda_launch says no (the shader kernels then run everything)
+	if ( engine::runtime::options != nullptr && !engine::runtime::options().vk_cuda_launch ) has_cuda = false;
 	if ( sh.adopted ) {
 		// the extensions the host enabled (subgroup size control and integer dot products are core in Vulkan 1.3)
 		const bool v13 = g.props.apiVersion >= VK_API_VERSION_1_3;
@@ -328,6 +352,13 @@ bool init_context( int dev ) {
 		has_mem_fd = en.has( VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME );
 		has_budget = en.has( VK_EXT_MEMORY_BUDGET_EXTENSION_NAME );
 		has_sg_ctl = en.has( VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME ) || ( v13 && en.sg_ctl );
+		has_cuda = has_cuda && en.has( VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME ) && en.cuda;   // optional: used where the host enabled it
+	}
+	if ( has_sm_builtins ) {
+		VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smp{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV };
+		VkPhysicalDeviceProperties2 p2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &smp };
+		vkGetPhysicalDeviceProperties2( g.phys, &p2 );
+		g.sm_count = smp.shaderSMCount;
 	}
 	// The kernels that reduce over a warp (subgroup operations, lane = thread % 32) take subgroups of 32: a device whose compute subgroups are
 	// another size by default (AMD's wave64, Intel's SIMD8 / 16) gets every pipeline created with a required subgroup size of 32 where it allows it
@@ -339,9 +370,11 @@ bool init_context( int dev ) {
 	}
 	VkPhysicalDeviceSubgroupSizeControlFeaturesEXT fsg{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT };
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR fdot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
+	VkPhysicalDeviceCudaKernelLaunchFeaturesNV fcuda{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV };
 	void* query_chain = nullptr;
 	if ( has_sg_ctl ) { fsg.pNext = query_chain; query_chain = &fsg; }
 	if ( has_dot_ext ) { fdot.pNext = query_chain; query_chain = &fdot; }
+	if ( has_cuda ) { fcuda.pNext = query_chain; query_chain = &fcuda; }
 	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, query_chain };
 	VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11 };
 	VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12 };
@@ -375,6 +408,7 @@ bool init_context( int dev ) {
 	}
 
 	g.int_dot = has_dot_ext && fdot.shaderIntegerDotProduct == VK_TRUE;
+	g.cuda = has_cuda && fcuda.cudaKernelLaunchFeatures == VK_TRUE;
 	if ( sg.subgroupSize != 32 ) {
 		g.sg32 = has_sg_ctl && fsg.subgroupSizeControl == VK_TRUE && sgp.minSubgroupSize <= 32 && sgp.maxSubgroupSize >= 32 &&
 			( sgp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ) != 0;
@@ -388,9 +422,12 @@ bool init_context( int dev ) {
 	want_sg.subgroupSizeControl = VK_TRUE;
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR want_dot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
 	want_dot.shaderIntegerDotProduct = VK_TRUE;
+	VkPhysicalDeviceCudaKernelLaunchFeaturesNV want_cuda{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV };
+	want_cuda.cudaKernelLaunchFeatures = VK_TRUE;
 	void* want_chain = nullptr;
 	if ( g.sg32 ) { want_sg.pNext = want_chain; want_chain = &want_sg; }
 	if ( g.int_dot ) { want_dot.pNext = want_chain; want_chain = &want_dot; }
+	if ( g.cuda ) { want_cuda.pNext = want_chain; want_chain = &want_cuda; }
 	VkPhysicalDeviceVulkan11Features want11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, want_chain };
 	want11.storageBuffer16BitAccess = f11.storageBuffer16BitAccess;
 	want11.uniformAndStorageBuffer16BitAccess = f11.uniformAndStorageBuffer16BitAccess;
@@ -435,6 +472,7 @@ bool init_context( int dev ) {
 	if ( has_sem_fd ) exts.push_back( VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME );
 	if ( has_budget ) exts.push_back( VK_EXT_MEMORY_BUDGET_EXTENSION_NAME );
 	if ( g.sg32 ) exts.push_back( VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME );
+	if ( g.cuda ) exts.push_back( VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME );
 	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
 	dci.ppEnabledExtensionNames = exts.data();
 	if ( sh.adopted ) {
@@ -458,6 +496,12 @@ bool init_context( int dev ) {
 
 	g.get_address = reinterpret_cast<PFN_vkGetBufferDeviceAddress>( vkGetDeviceProcAddr( g.device, "vkGetBufferDeviceAddress" ) );
 	if ( g.get_address == nullptr ) return false;
+	if ( g.cuda ) {
+		g.cuda_create_module = reinterpret_cast<PFN_vkCreateCudaModuleNV>( vkGetDeviceProcAddr( g.device, "vkCreateCudaModuleNV" ) );
+		g.cuda_create_function = reinterpret_cast<PFN_vkCreateCudaFunctionNV>( vkGetDeviceProcAddr( g.device, "vkCreateCudaFunctionNV" ) );
+		g.cuda_cmd_launch = reinterpret_cast<PFN_vkCmdCudaLaunchKernelNV>( vkGetDeviceProcAddr( g.device, "vkCmdCudaLaunchKernelNV" ) );
+		g.cuda = g.cuda_create_module && g.cuda_create_function && g.cuda_cmd_launch;
+	}
 	g.default_stream = make_stream( g );   // here, once: the threads sharing the device all see it
 	g.ok = true;
 	return g.ok;
@@ -1316,6 +1360,87 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 	vkCmdDispatch( cb, gx, gy, gz );
 	after_command( s, cb );
 	if ( timed ) prof_end( cb, p );
+	if ( s->capture ) ++s->capture_nodes;
+}
+
+bool cuda_launch_available() { return ctx().cuda; }
+uint32_t sm_count() { return ctx().sm_count; }
+
+CudaFunction* cuda_function( const char* ptx_path, const char* name ) {
+	Ctx& c = ctx();
+	if ( !c.cuda ) return nullptr;
+	std::string mod( ptx_path );
+	mod = mod.substr( mod.find_last_of( '/' ) + 1 );
+	if ( mod.size() > 4 && mod.compare( mod.size() - 4, 4, ".ptx" ) == 0 ) mod.resize( mod.size() - 4 );
+	const std::string key = mod + ":" + name;
+	std::lock_guard<std::mutex> lk( c.mu );
+	if ( auto it = c.cuda_functions.find( key ); it != c.cuda_functions.end() ) return it->second;
+	auto mit = c.cuda_modules.find( mod );
+	if ( mit == c.cuda_modules.end() ) {
+		// the PTX text, NUL-terminated: the library's embedded copy, else the file
+		std::vector<char> text;
+		size_t embedded_bytes = 0;
+		const uint8_t* embedded = embedded_spv != nullptr && std::getenv( "ENGINE_SPV_DIR" ) == nullptr ? embedded_spv( mod.c_str(), &embedded_bytes ) : nullptr;
+		if ( embedded != nullptr ) text.assign( embedded, embedded + embedded_bytes );
+		else if ( FILE* f = std::fopen( ptx_path, "rb" ) ) {
+			std::fseek( f, 0, SEEK_END );
+			const long n = std::ftell( f );
+			std::fseek( f, 0, SEEK_SET );
+			text.resize( n > 0 ? size_t( n ) : 0 );
+			if ( n <= 0 || std::fread( text.data(), 1, size_t( n ), f ) != size_t( n ) ) text.clear();
+			std::fclose( f );
+		}
+		VkCudaModuleNV m = VK_NULL_HANDLE;
+		const auto t0 = std::chrono::steady_clock::now();
+		if ( !text.empty() ) {
+			text.push_back( '\0' );
+			VkCudaModuleCreateInfoNV ci{ VK_STRUCTURE_TYPE_CUDA_MODULE_CREATE_INFO_NV };
+			ci.dataSize = text.size();
+			ci.pData = text.data();
+			if ( c.cuda_create_module( c.device, &ci, nullptr, &m ) != VK_SUCCESS ) m = VK_NULL_HANDLE;
+		}
+		if ( m == VK_NULL_HANDLE ) std::fprintf( stderr, "[!] Vulkan backend: CUDA module %s could not be loaded; its kernels run on the shader cores\n", mod.c_str() );
+		else std::fprintf( stderr, "[*] Vulkan backend: CUDA module %s loaded (%.0f KB) in %.0f ms\n", mod.c_str(), text.size() / 1024.0,
+			std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+		mit = c.cuda_modules.emplace( mod, m ).first;
+	}
+	CudaFunction* cf = nullptr;
+	if ( mit->second != VK_NULL_HANDLE ) {
+		VkCudaFunctionCreateInfoNV fi{ VK_STRUCTURE_TYPE_CUDA_FUNCTION_CREATE_INFO_NV };
+		fi.module = mit->second;
+		fi.pName = name;
+		VkCudaFunctionNV f = VK_NULL_HANDLE;
+		if ( c.cuda_create_function( c.device, &fi, nullptr, &f ) == VK_SUCCESS ) {
+			cf = new CudaFunction();
+			cf->fn = f;
+			cf->prof.name = name;
+		}
+	}
+	c.cuda_functions[key] = cf;
+	return cf;
+}
+
+void cuda_launch( stream_t st, CudaFunction* fn, uint32_t gx, uint32_t gy, uint32_t gz, uint32_t bx, uint32_t by, uint32_t bz, uint32_t smem,
+	const void* const* params, uint32_t nparams ) {
+	ctx();
+	if ( !cur().default_stream ) cur().default_stream = make_stream();
+	vk_stream* s = resolve_stream( st );
+	VkCommandBuffer cb = command_cb( s );
+	const bool timed = prof_begin( s, cb );
+	VkCudaLaunchInfoNV li{ VK_STRUCTURE_TYPE_CUDA_LAUNCH_INFO_NV };
+	li.function = fn->fn;
+	li.gridDimX = gx;
+	li.gridDimY = gy;
+	li.gridDimZ = gz;
+	li.blockDimX = bx;
+	li.blockDimY = by;
+	li.blockDimZ = bz;
+	li.sharedMemBytes = smem;
+	li.paramCount = nparams;
+	li.pParams = params;
+	cur().cuda_cmd_launch( cb, &li );
+	after_command( s, cb );
+	if ( timed ) prof_end( cb, &fn->prof );
 	if ( s->capture ) ++s->capture_nodes;
 }
 

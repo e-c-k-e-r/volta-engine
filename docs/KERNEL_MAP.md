@@ -39,7 +39,11 @@ the tests are described in [TESTS.md](TESTS.md). `gate.sh sass` fingerprints eve
 ## Dense FP16 GEMM: `src/kernels/cuda/gemm/gemm_f16.cu`
 
 `Gemm::tn` and `Gemm::nn` on Volta's tensor cores (`mma.sync.m8n8k4`, FP32 accumulation, swizzled two-stage shared-memory tiles, split-k), the engine's GEMM
-for the language models' dense products (on ROCm it forwards to hipBLAS). Verified by `test_gemm`, `bench_gemm`.
+for the language models' dense products (on ROCm it forwards to hipBLAS); the device code is `gemm_f16_kernel.cuh`. Verified by `test_gemm`, `bench_gemm`.
+`gemm_f16_vk.cu` makes the same kernels PTX entry points with C names (`cuda_gemm.ptx` in the Vulkan build's kernel directory, where nvcc is
+found): on NVIDIA GPUs whose Vulkan driver has `VK_NV_cuda_kernel_launch` but no cooperative matrices (Volta) the Vulkan backend launches them
+from its command buffers for every FP16 matmul (`src/backend/vulkan/mod_cuda.cpp`, gemm_f16.cu's tiles and split-k; `vk_cuda_launch` turns it
+off), held against the CUDA goldens by `test_ops_linear`, `test_ops_flash` and `test_ops_moe`.
 
 ## Module kernels: `src/backend/cuda/modules/`
 
@@ -121,7 +125,7 @@ CUDA kernels by `test_ops_attention`); `kda_chunk.slang` is the same for GLM's K
 step). `tts.slang` holds the
 TTS and NeMo codec operators of the Vulkan build (embedding mix, the norms, QK norm + RoPE, gate, SwiGLU, the flow head's AdaLN and guided step,
 FSQ, the codec's K-major columns, HalfSnake, interleave); the CUDA forms are `src/backend/cuda/modules/tts.cu`, and the Vulkan GEMMs are llama.cpp's
-FP16 matmul (FP16 or FP32 out) and its FP32 one (`bench_tts_ops`). `trellis.slang` is the Vulkan EXL3 linear, compiled once per width code (and
+FP16 matmul (FP16 or FP32 out; the CUDA GEMM where the device launches CUDA kernels, see the dense GEMM) and its FP32 one (`bench_tts_ops`). `trellis.slang` is the Vulkan EXL3 linear, compiled once per width code (and
 with the codebook's byte sum as a packed dot product where the device has one): `trellis_had128` (the rotations, a butterfly), `trellis_gemv`
 (up to 16 rows: a warp per 16 x 16 tile, a lane's 8 windows funnel shifts of three words, the codebook on FP16 pairs, FP32 sums) and
 `trellis_dequant` (the weight decoded to FP16 [n, k] for llama.cpp's matmul, staged for whole-row writes), both also in an `_ext` form for the

@@ -33,6 +33,14 @@ bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int
 bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split = 0 );
 // The FP16-out matmul, split over K (FP32 partials summed in order, scratch slot 3) when few output tiles would run over a long K
 bool ggml_f16_matmul_split( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream );
+// The tensor-core path of the current device: CudaLaunch where VK_NV_cuda_kernel_launch is enabled (NVIDIA; Volta's only one, it has no
+// cooperative matrices), else None (the shader-core kernels). A cooperative-matrix path would be another value here
+enum class TensorPath { None, CudaLaunch };
+TensorPath tensor_path();
+// out [m, n] = x [m, k] times the FP16 weights w [n, k] on the CUDA backend's tensor-core GEMM (mod_cuda.cpp), FP16 or (f32_out) FP32 out.
+// k_split > 0: the K range in slabs of k_split, slab s's FP32 partial into out + s * m * n; else split as the GEMM's model decides, the partials
+// summed into out. False where it does not run (no CUDA launches, k not a multiple of 8, w or x not 16-byte aligned)
+bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, int k_split, stream_t stream );
 // FP32: d [n rows of stride_d][m] = a [m, k] times b [n, k]^T (d[j * stride_d + i] = a row i . b row j), on llama.cpp's matmul; false where it
 // does not apply (no bound pipelines, operands not 16-byte aligned)
 bool ggml_f32_matmul( const void* a, const void* b, void* d, int m, int n, int k, int stride_d, stream_t stream );
