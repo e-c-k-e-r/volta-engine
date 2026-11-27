@@ -113,7 +113,9 @@ a decode or short verify on an FP16 cache with head_dim 256 or 512 takes `fa_dec
 lane holds its dimensions of the query vectors and accumulators, each warp streams its keys from the cache and sums their dot products across the warp);
 `test_vulkan_attention` holds both against `ref_attention` on the same device. Without a cache (no slots) `fa_attn` attends dense rows to every key,
 and `fa_dense_64` is the head_dim 64 form of that (a thread per query with its accumulators in registers, a warp per quarter of each 64-key tile,
-FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`). `tts.slang` holds the
+FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`). `attn_prep.slang`'s `norm_rope_store` is
+the step before the attention in one kernel (`Attention::norm_rope_store`: q / k / v head norms, the rotary embedding of q and k, k and v into
+an FP16 cache, a group per row and head), bit for bit the three kernels it replaces; other cache formats take those three. `tts.slang` holds the
 TTS and NeMo codec operators of the Vulkan build (embedding mix, the norms, QK norm + RoPE, gate, SwiGLU, the flow head's AdaLN and guided step,
 FSQ, the codec's K-major columns, HalfSnake, interleave); the CUDA forms are `src/backend/cuda/modules/tts.cu`, and the Vulkan GEMMs are llama.cpp's
 FP16 matmul (FP16 or FP32 out) and its FP32 one (`bench_tts_ops`). `trellis.slang` is the Vulkan EXL3 linear, compiled once per width code (and

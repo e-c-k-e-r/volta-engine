@@ -1472,7 +1472,9 @@ void Qwen4ExpPipeline::ple_prepare( const pod::BatchRows& rows, int m, backend::
 	if ( tp_ > 1 ) share.barrier( tp_ );   // every rank's rows are in
 	if ( timed ) t[2] = PleTimes::clock::now();
 	backend::memcpy_async( ple_emb_.data, shared_emb, static_cast<size_t>( m ) * D * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+#if !ENGINE_HOST_COPY_AT_CALL
 	backend::stream_sync( stream );   // the host buffer is reused by the next call
+#endif
 	if ( timed ) t[3] = PleTimes::clock::now();
 	if ( tp_ > 1 ) share.barrier( tp_ );   // every rank has copied it
 	if ( timed ) {

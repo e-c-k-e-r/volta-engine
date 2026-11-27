@@ -57,6 +57,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# The attention's input step (src/kernels/slang/attn_prep.slang: head norms, rotary embedding and the FP16 cache store in one kernel)
+	foreach(entry norm_rope_store)
+		set(sout ${SLANG_OUT}/${entry}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/attn_prep.slang -target spirv -stage compute -entry ${entry} -DENGINE_TARGET_CPU=0 -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/attn_prep.slang
+			COMMENT "slangc ${entry} -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# Vision tower operators (src/kernels/slang/vision.slang)
 	foreach(entry vision_f32_to_f16 vision_pos_interp vision_patch_embed vision_norm vision_qkv_rope vision_merge_gather vision_attention vision_bias_act vision_bias_residual vision_qkv_rope2d vision_pool_std)
 		set(sout ${SLANG_OUT}/${entry}.spv)

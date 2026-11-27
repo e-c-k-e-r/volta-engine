@@ -18,3 +18,10 @@
 #ifndef ENGINE_BACKEND_HAS_GRAPHS
 	#define ENGINE_BACKEND_HAS_GRAPHS 1
 #endif
+
+// 1 when memcpy_async has read a host source by the time it returns (Vulkan copies it into a staging buffer, CPU copies it outright), so the
+// host buffer is free to refill at once; 0 when the copy reads it later on the stream (CUDA: keep it until the stream has passed the copy).
+// A backend's runtime.h may define it first; the default is 0.
+#ifndef ENGINE_HOST_COPY_AT_CALL
+	#define ENGINE_HOST_COPY_AT_CALL 0
+#endif

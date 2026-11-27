@@ -107,6 +107,17 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
 * **EXL3 from a QAT NVFP4 checkpoint:** +0.009 nats against the QAT checkpoint itself; the quantization-aware tuning is lost.
 * **Agent-turn NLL as a quantization metric:** too low-entropy to resolve differences; use high-entropy text, weight-space error or KL.
 
+## Vulkan
+
+* **Folding the split-K attention reduce into `fa_decode` (Gemma 4 E4B decode).** Decode keeps the split count chosen at graph capture, sized for
+  the longest context, so `fa_reduce` runs on every layer at every step. Skipping it (wrong output, timing only) bounds the gain at 3.8%: 9.33
+  -> 8.98 ms per step on a V100.
+  - A correct fold needs the last workgroup to read the other splits' partials coherently. Slang rejects `globallycoherent` on the
+    buffer-device-address pointers every kernel uses.
+  - Atomic loads of 64 splits' partials would cost more than the dispatch.
+
+  llama.cpp's Vulkan flash attention keeps its split-K reduce as a separate dispatch too.
+
 ## Steering
 
 * **Static clamp files on GLM-5.3-Flash and DeepSeek-V4.1-Flash:** only the 27B responds; see [STEERING.md](STEERING.md).

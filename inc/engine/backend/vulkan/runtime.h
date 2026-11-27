@@ -40,6 +40,8 @@ void concurrent_begin( stream_t s );
 void concurrent_next( stream_t s );
 void concurrent_end( stream_t s );
 
+// A host source is copied into a staging buffer before the call returns (the device copy runs from there)
+#define ENGINE_HOST_COPY_AT_CALL 1
 void memcpy_async( void* dst, const void* src, size_t bytes, Copy dir, stream_t s );
 void memcpy2d_async( void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Copy dir, stream_t s );
 void memcpy_sync( void* dst, const void* src, size_t bytes, Copy dir );

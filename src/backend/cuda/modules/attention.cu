@@ -1,5 +1,7 @@
 #include "engine/core/scratch.h"
 #include "engine/modules/attention.h"
+#include "engine/modules/norm.h"
+#include "engine/modules/rope.h"
 #include "engine/backend/cuda/activation.cuh"
 #include "engine/backend/cuda/reduce.cuh"
 #include "kv_quant.cuh"
@@ -1540,6 +1542,19 @@ void Attention::forward_sparse(
 		#undef LAUNCH_SPARSE
 		attn_reduce_kernel<256><<<dim3( num_q_heads, M ), dim3( head_dim ), 0, stream>>>( workspace, g, o, num_q_heads, n_chunks, 0 );
 	}
+}
+
+// Attention::norm_rope_store as its three steps
+void Attention::norm_rope_store( const pod::KVRef& kv, pod::TensorView& q, pod::TensorView& k, pod::TensorView& v, const pod::TensorView& q_norm,
+	const pod::TensorView& k_norm, float eps, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim, int rot_pairs, float freq_base,
+	size_t slot_stride, int layer_idx, const pod::BatchRows* d_rows, int count, int max_seq, backend::stream_t stream ) {
+	RMSNorm::forward_heads( q, q_norm, num_q_heads, head_dim, eps, 0.0f, stream );
+	if ( num_kv_heads > 0 ) {
+		RMSNorm::forward_heads( k, k_norm, num_kv_heads, head_dim, eps, 0.0f, stream );
+		RMSNorm::forward_heads( v, pod::TensorView{}, num_kv_heads, head_dim, eps, 0.0f, stream );
+	}
+	RoPE::forward( q, k, num_q_heads, num_kv_heads, head_dim, rot_dim, d_rows, count, freq_base, stream, false, rot_pairs );
+	if ( num_kv_heads > 0 ) store_kv_cache( kv, k, v, slot_stride, layer_idx, d_rows, count, num_kv_heads, head_dim, max_seq, stream );
 }
 
 } // namespace engine::modules

@@ -2,6 +2,8 @@
 // cpu_kernels.h first: the Slang prelude defines int4, which the backend shim only declares when the prelude is absent
 #include "cpu_kernels.h"
 #include "engine/modules/attention.h"
+#include "engine/modules/norm.h"
+#include "engine/modules/rope.h"
 #include "engine/backend/tiers.h"
 
 namespace engine::modules {
@@ -42,6 +44,19 @@ void Attention::store_kv_cache(
 	pv.data = static_cast<half*>( kv.v );
 	pv.src = const_cast<half*>( v.ptr<const half>() );
 	impl::cpu_dispatch( ::kv_store_f16, &pv, groups );
+}
+
+// Attention::norm_rope_store as its three steps
+void Attention::norm_rope_store( const pod::KVRef& kv, pod::TensorView& q, pod::TensorView& k, pod::TensorView& v, const pod::TensorView& q_norm,
+	const pod::TensorView& k_norm, float eps, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim, int rot_pairs, float freq_base,
+	size_t slot_stride, int layer_idx, const pod::BatchRows* d_rows, int count, int max_seq, backend::stream_t stream ) {
+	RMSNorm::forward_heads( q, q_norm, num_q_heads, head_dim, eps, 0.0f, stream );
+	if ( num_kv_heads > 0 ) {
+		RMSNorm::forward_heads( k, k_norm, num_kv_heads, head_dim, eps, 0.0f, stream );
+		RMSNorm::forward_heads( v, pod::TensorView{}, num_kv_heads, head_dim, eps, 0.0f, stream );
+	}
+	RoPE::forward( q, k, num_q_heads, num_kv_heads, head_dim, rot_dim, d_rows, count, freq_base, stream, false, rot_pairs );
+	if ( num_kv_heads > 0 ) store_kv_cache( kv, k, v, slot_stride, layer_idx, d_rows, count, num_kv_heads, head_dim, max_seq, stream );
 }
 
 } // namespace engine::modules

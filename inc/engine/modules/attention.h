@@ -40,6 +40,32 @@ struct Attention {
 		backend::stream_t stream = nullptr
 	);
 
+	// The step between the q / k / v projections and the attention: q, k and v normed per head (RMSNorm::forward_heads with q_norm, k_norm
+	// and no weight for v), q and k rotated (RoPE::forward, rotate-half, rot_pairs as there), k and v into the cache (store_kv_cache). With
+	// num_kv_heads 0 (a layer that reads another layer's cache) q alone. One kernel on Vulkan for FP16 caches, the same result; the three
+	// steps in turn elsewhere
+	static void norm_rope_store(
+		const pod::KVRef& kv,
+		pod::TensorView& q,
+		pod::TensorView& k,
+		pod::TensorView& v,
+		const pod::TensorView& q_norm,
+		const pod::TensorView& k_norm,
+		float eps,
+		int num_q_heads,
+		int num_kv_heads,
+		int head_dim,
+		int rot_dim,
+		int rot_pairs,
+		float freq_base,
+		size_t slot_stride,
+		int layer_idx,
+		const pod::BatchRows* d_rows,
+		int count,
+		int max_seq,
+		backend::stream_t stream
+	);
+
 	static void forward_decode(
 		const pod::KVRef& kv,
 		const pod::TensorView& q,

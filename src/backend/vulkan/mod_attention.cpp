@@ -4,6 +4,8 @@
 #include "mod_common.h"
 #include "mod_attention.h"
 #include "engine/modules/attention.h"
+#include "engine/modules/norm.h"
+#include "engine/modules/rope.h"
 #include "engine/backend/tiers.h"
 #include "engine/runtime/options.h"
 #include <algorithm>
@@ -56,6 +58,33 @@ void Attention::store_kv_cache(
 	pv.data = vki::dp( kv.v );
 	pv.src = vki::dp( v.data );
 	vki::launch( "kv_store_f16", pv, stream, groups );
+}
+
+// One kernel for FP16 caches (attn_prep.slang, bit for bit the three steps); other formats and heads over 512 take the three steps, the norms
+// as one run of independent ops
+void Attention::norm_rope_store( const pod::KVRef& kv, pod::TensorView& q, pod::TensorView& k, pod::TensorView& v, const pod::TensorView& q_norm,
+	const pod::TensorView& k_norm, float eps, int num_q_heads, int num_kv_heads, int head_dim, int rot_dim, int rot_pairs, float freq_base,
+	size_t slot_stride, int layer_idx, const pod::BatchRows* d_rows, int count, int max_seq, backend::stream_t stream ) {
+	const bool f16 = num_kv_heads == 0 || ( kv.kq == pod::KVQ::F16 && kv.vq == pod::KVQ::F16 );
+	if ( f16 && head_dim <= 512 && rot_dim <= head_dim && rot_dim / 2 <= 256 ) {
+		ENGINE_ASSERT( kv.ring == 0 || kv.ring == max_seq, "Attention::norm_rope_store: a ring cache has max_seq rows per layer" );
+		vki::NormRopeStoreParams p{ vki::dp( q.data ), vki::dp( k.data ), vki::dp( v.data ), vki::dp( q_norm.data ), vki::dp( k_norm.data ), vki::dp( kv.k ),
+			vki::dp( kv.v ), vki::rows_slot( d_rows ), vki::rows_pos( d_rows ), static_cast<int64_t>( slot_stride ), num_q_heads, num_kv_heads, head_dim, rot_dim,
+			rot_pairs, layer_idx, max_seq, kv.ring, eps, freq_base, 0.0f };
+		vki::launch( "norm_rope_store", p, stream, count, num_q_heads + 2 * num_kv_heads );
+		return;
+	}
+	backend::concurrent_begin( stream );
+	RMSNorm::forward_heads( q, q_norm, num_q_heads, head_dim, eps, 0.0f, stream );
+	if ( num_kv_heads > 0 ) {
+		backend::concurrent_next( stream );
+		RMSNorm::forward_heads( k, k_norm, num_kv_heads, head_dim, eps, 0.0f, stream );
+		backend::concurrent_next( stream );
+		RMSNorm::forward_heads( v, pod::TensorView{}, num_kv_heads, head_dim, eps, 0.0f, stream );
+	}
+	backend::concurrent_end( stream );
+	RoPE::forward( q, k, num_q_heads, num_kv_heads, head_dim, rot_dim, d_rows, count, freq_base, stream, false, rot_pairs );
+	if ( num_kv_heads > 0 ) store_kv_cache( kv, k, v, slot_stride, layer_idx, d_rows, count, num_kv_heads, head_dim, max_seq, stream );
 }
 
 namespace vk_attn {

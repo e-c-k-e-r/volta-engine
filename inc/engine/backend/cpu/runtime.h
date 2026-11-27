@@ -40,6 +40,7 @@ inline void concurrent_begin( stream_t ) {}
 inline void concurrent_next( stream_t ) {}
 inline void concurrent_end( stream_t ) {}
 
+#define ENGINE_HOST_COPY_AT_CALL 1   // the copies run on the calling thread
 inline void memcpy_async( void* dst, const void* src, size_t bytes, Copy, stream_t ) { if ( bytes ) std::memmove( dst, src, bytes ); }
 inline void memcpy2d_async( void* dst, size_t dpitch, const void* src, size_t spitch, size_t width, size_t height, Copy, stream_t ) {
 	for ( size_t r = 0; r < height; ++r ) {

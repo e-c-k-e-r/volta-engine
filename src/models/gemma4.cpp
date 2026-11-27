@@ -577,7 +577,9 @@ void Gemma4Pipeline::ple_rows( const int* token_ids, int count, backend::stream_
 			ple_tok_.ptr<backend::half_t>(), stream );
 	}
 	else backend::memcpy_async( ple_tok_.data, ple_stage_, static_cast<size_t>( count ) * width * sizeof( backend::half_t ), backend::Copy::H2D, stream );
+#if !ENGINE_HOST_COPY_AT_CALL
 	backend::stream_sync( stream );   // the next forward reuses the stage
+#endif
 }
 
 // The rows' per-layer inputs, layer-major: ( rms_norm( the projection of their embeddings ) * w + the table rows * sqrt( ple_dim ) ) / sqrt( 2 ). The
@@ -785,22 +787,11 @@ bool Gemma4Pipeline::layer_forward( const Gemma4LayerWeights& lw, int layer, int
 	}
 	backend::concurrent_end( stream );
 	if ( !lw.shared_kv && k_eq_v ) backend::memcpy_async( v.data, k.data, k.size_bytes(), backend::Copy::D2D, stream );
-	backend::concurrent_begin( stream );
-	RMSNorm::forward_heads( q, lw.q_norm, q_heads_, hd, eps, 0.0f, stream );
-	if ( !lw.shared_kv ) {
-		backend::concurrent_next( stream );
-		RMSNorm::forward_heads( k, lw.k_norm, kvh, hd, eps, 0.0f, stream );
-		backend::concurrent_next( stream );
-		RMSNorm::forward_heads( v, pod::TensorView{}, kvh, hd, eps, 0.0f, stream );   // unweighted v_norm
-	}
-	backend::concurrent_end( stream );
+	// the head norms (v_norm unweighted), the rotary embedding and the cache store; a KV-sharing layer reads its source's cache, so the queries only
 	const float theta = lw.is_full ? config_.full_rope_theta : config_.swa_rope_theta;
 	const int rot_pairs = lw.is_full ? config_.full_rot_pairs : 0;
-	if ( lw.shared_kv ) RoPE::forward( q, k, q_heads_, 0, hd, hd, rows_, m, theta, stream, false, rot_pairs );   // the queries only
-	else {
-		RoPE::forward( q, k, q_heads_, kvh, hd, hd, rows_, m, theta, stream, false, rot_pairs );
-		Attention::store_kv_cache( kv, k, v, pool.slot_stride_elems, kv_layer, rows_, m, kvh, hd, pool.max_seq_len, stream );
-	}
+	Attention::norm_rope_store( kv, q, k, v, lw.q_norm, lw.k_norm, eps, q_heads_, lw.shared_kv ? 0 : kvh, hd, hd, rot_pairs, theta, pool.slot_stride_elems,
+		kv_layer, rows_, m, pool.max_seq_len, stream );
 	// Tensor cores: K/V tiles shared across the rows of one slot, a block per row otherwise
 	Attention::forward_prefill( kv, q, pod::TensorView{}, o, pool.slot_stride_elems, kv_layer, rows_, m, q_heads_, kvh, hd, pool.max_seq_len, stream,
 		m > pod::MAX_BATCH ? key_hint_ : 0, m <= pod::MAX_BATCH && !attn_tc_, 1.0f, lw.is_full ? 0 : config_.swa_window );

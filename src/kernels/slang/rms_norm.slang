@@ -145,45 +145,89 @@ void rms_norm_f32(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform 
 	}
 }
 
+// The sum over a 256-thread group, a tree in shared memory: the order the norms have always summed in (Gemma 4 31B's large residuals make
+// its logits move with the order, so a subgroup reduction is not a free change)
+float group_sum256(int t, float v) {
+	s_red[t] = v;
+	GroupMemoryBarrierWithGroupSync();
+	for (int s = 128; s > 0; s >>= 1) {
+		if (t < s) s_red[t] += s_red[t + s];
+		GroupMemoryBarrierWithGroupSync();
+	}
+	let total = s_red[0];
+	GroupMemoryBarrierWithGroupSync();   // every thread has read s_red[0]
+	return total;
+}
+
+// Columns a thread keeps in registers between the passes (rows up to 16 x 256 = 4096 wide); wider rows read them again
+static const int ADD_NORMED_REG = 16;
+
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void add_normed(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform AddNormedParams p) {
 	let t = int(tid.x);
-	half* row_y = p.y + int64_t(gid.x) * p.hidden_size;
-	float* row_r = p.resid + int64_t(gid.x) * p.hidden_size;
+	let H = p.hidden_size;
+	half* row_y = p.y + int64_t(gid.x) * H;
+	float* row_r = p.resid + int64_t(gid.x) * H;
+	half* row_n = p.next + int64_t(gid.x) * H;
+	let held = H <= ADD_NORMED_REG * 256;
+	float yv[ADD_NORMED_REG];
+	float rv[ADD_NORMED_REG];
+	float wv[ADD_NORMED_REG];    // both norms' weights read with the row: every global read in one round
+	float nwv[ADD_NORMED_REG];
 	float sq = 0.0f;
-	for (int i = t; i < p.hidden_size; i += 256) {
-		let v = float(row_y[i]);
-		sq = fma(v, v, sq);
+	if (held) {
+		[ForceUnroll]
+		for (int k = 0; k < ADD_NORMED_REG; ++k) {
+			let i = t + k * 256;
+			yv[k] = i < H ? float(row_y[i]) : 0.0f;
+			rv[k] = i < H ? row_r[i] : 0.0f;
+			wv[k] = i < H && p.has_weight != 0 ? float(p.weight[i]) + p.bias : 1.0f;
+			nwv[k] = i < H && p.next_mode == 2 && p.has_next_weight != 0 ? float(p.next_weight[i]) + p.bias : 1.0f;
+			sq = fma(yv[k], yv[k], sq);
+		}
+	} else {
+		for (int i = t; i < H; i += 256) {
+			let v = float(row_y[i]);
+			sq = fma(v, v, sq);
+		}
 	}
-	s_red[t] = sq;
-	GroupMemoryBarrierWithGroupSync();
-	for (int s = 128; s > 0; s >>= 1) {
-		if (t < s) s_red[t] += s_red[t + s];
-		GroupMemoryBarrierWithGroupSync();
-	}
-	let inv = inv_rms_from(s_red[0], p.hidden_size, p.eps);
-	half* row_n = p.next + int64_t(gid.x) * p.hidden_size;
+	let inv = inv_rms_from(group_sum256(t, sq), H, p.eps);
 	float nsq = 0.0f;
-	for (int i = t; i < p.hidden_size; i += 256) {
-		let w = p.has_weight != 0 ? float(p.weight[i]) + p.bias : 1.0f;
-		let r = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
-		row_r[i] = r;
-		if (p.next_mode == 1) row_n[i] = half(r);
-		nsq = fma(r, r, nsq);
+	if (held) {
+		[ForceUnroll]
+		for (int k = 0; k < ADD_NORMED_REG; ++k) {
+			let i = t + k * 256;
+			if (i < H) {
+				let r = (rv[k] + yv[k] * inv * wv[k]) * p.scale;
+				rv[k] = r;
+				row_r[i] = r;
+				if (p.next_mode == 1) row_n[i] = half(r);
+				nsq = fma(r, r, nsq);
+			}
+		}
+	} else {
+		for (int i = t; i < H; i += 256) {
+			let w = p.has_weight != 0 ? float(p.weight[i]) + p.bias : 1.0f;
+			let r = (row_r[i] + float(row_y[i]) * inv * w) * p.scale;
+			row_r[i] = r;
+			if (p.next_mode == 1) row_n[i] = half(r);
+			nsq = fma(r, r, nsq);
+		}
 	}
 	if (p.next_mode != 2) return;
-	GroupMemoryBarrierWithGroupSync();   // every thread has read s_red[0]
-	s_red[t] = nsq;
-	GroupMemoryBarrierWithGroupSync();
-	for (int s = 128; s > 0; s >>= 1) {
-		if (t < s) s_red[t] += s_red[t + s];
-		GroupMemoryBarrierWithGroupSync();
-	}
-	let ninv = inv_rms_from(s_red[0], p.hidden_size, p.eps);
-	for (int i = t; i < p.hidden_size; i += 256) {
-		let w = p.has_next_weight != 0 ? float(p.next_weight[i]) + p.bias : 1.0f;
-		row_n[i] = half(row_r[i] * w * ninv);
+	let ninv = inv_rms_from(group_sum256(t, nsq), H, p.eps);
+	if (held) {
+		[ForceUnroll]
+		for (int k = 0; k < ADD_NORMED_REG; ++k) {
+			let i = t + k * 256;
+			if (i < H) row_n[i] = half(rv[k] * nwv[k] * ninv);
+		}
+	} else {
+		for (int i = t; i < H; i += 256) {
+			let w = p.has_next_weight != 0 ? float(p.next_weight[i]) + p.bias : 1.0f;
+			row_n[i] = half(row_r[i] * w * ninv);
+		}
 	}
 }
 

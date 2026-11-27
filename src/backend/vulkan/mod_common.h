@@ -65,6 +65,12 @@ struct ConvTiledParams { uint64_t src, dst, history, weights, slots; int channel
 struct RecurrentParams { uint64_t state, qkv, gate, beta, output, slots, snap, snap_on; int h_k, h_v, rows, snap_rows; float scale; int64_t slot_stride, snap_stride; };
 struct GatedNormParams { uint64_t attn_out, z, norm_weight; int num_v_heads, head_dim, use_sigmoid, has_z, has_weight; };
 struct KvStoreParams { uint64_t data, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, ring; };
+struct NormRopeStoreParams {
+	uint64_t q, k, v, q_norm, k_norm, k_cache, v_cache, slots, pos;
+	int64_t slot_stride;
+	int num_q_heads, num_kv_heads, head_dim, rot_dim, rot_pairs, layer_idx, max_seq, ring;
+	float eps, freq_base, bias;
+};
 struct KvStoreQParams { uint64_t data, scales, src, slots, positions; int64_t slot_stride; int layer_idx, count, total_elems, max_seq, q, ring; };
 struct InitStreamsParams { uint64_t in_, streams; int hidden_size; };
 struct HeadMeanParams { uint64_t streams, final_hidden; int hidden_size; };
