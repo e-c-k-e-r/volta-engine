@@ -1,6 +1,7 @@
 // EXL3 trellis linear (Linear::forward, CUDA and Vulkan builds) at a model's projection shapes: time per call over several weight copies
-// (cold L2) and the GB/s of the packed tiles. Random words (a valid trellis at any width; timing only).
-//   bench_trellis_shapes [--code C] [--volta] [--rows 1,4,8,40,512] [--reps N] [-- K N ...]   default Gemma 4 31B's (4 bits, stock order)
+// (cold L2) and the GB/s of the packed tiles. Random words (a valid trellis at any width; timing only). --nvfp4 times NVFP4 weights instead
+// (random codes, E4M3 block scales; the GB/s of codes and scales).
+//   bench_trellis_shapes [--code C] [--volta] [--nvfp4] [--rows 1,4,8,40,512] [--reps N] [-- K N ...]   default Gemma 4 31B's (4 bits, stock order)
 #include "engine/core/arena.h"
 #include "engine/backend/numeric.h"
 #include "engine/backend/runtime.h"
@@ -19,12 +20,13 @@ using backend::half_t;
 
 int main( int argc, char** argv ) {
 	int code = 4, reps = 5;
-	bool volta = false;
+	bool volta = false, nvfp4 = false;
 	std::vector<int> rows = { 1, 4, 8, 40, 512 };
 	std::vector<std::pair<int, int>> shapes;
 	for ( int i = 1; i < argc; ++i ) {
 		if ( !std::strcmp( argv[i], "--code" ) && i + 1 < argc ) code = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--volta" ) ) volta = true;
+		else if ( !std::strcmp( argv[i], "--nvfp4" ) ) nvfp4 = true;
 		else if ( !std::strcmp( argv[i], "--reps" ) && i + 1 < argc ) reps = std::atoi( argv[++i] );
 		else if ( !std::strcmp( argv[i], "--rows" ) && i + 1 < argc ) {
 			rows.clear();
@@ -39,14 +41,27 @@ int main( int argc, char** argv ) {
 	pod::MemoryArena arena;
 	ENGINE_ASSERT( core::arena_create( arena, 0, 6ULL << 30 ), "arena" );
 	std::mt19937 rng( 1234 );
-	std::printf( "code %d (%s), %s order\n", code, modules::trellis_is_half( code ) ? "half-integer rate" : "whole bits", volta ? "Volta" : "stock" );
+	if ( nvfp4 ) std::printf( "NVFP4\n" );
+	else std::printf( "code %d (%s), %s order\n", code, modules::trellis_is_half( code ) ? "half-integer rate" : "whole bits", volta ? "Volta" : "stock" );
 	for ( auto [k, n] : shapes ) {
 		const size_t tile_bytes = static_cast<size_t>( modules::trellis_tile_u16( code ) ) * 2;
-		const size_t wbytes = static_cast<size_t>( k / 16 ) * ( n / 16 ) * tile_bytes;
+		const size_t wbytes = nvfp4 ? static_cast<size_t>( k ) * n / 2 + static_cast<size_t>( k ) * n / 16 : static_cast<size_t>( k / 16 ) * ( n / 16 ) * tile_bytes;
 		const int copies = static_cast<int>( std::max<size_t>( 2, std::min<size_t>( 8, ( 256ull << 20 ) / wbytes + 1 ) ) );
 		std::vector<pod::LinearWeight> ws;
 		std::vector<uint16_t> host( wbytes / 2 );
-		for ( int c = 0; c < copies; ++c ) {
+		for ( int c = 0; c < copies && nvfp4; ++c ) {
+			// the loader's prepacked layout: codes [n / 32][k / 16][32 lanes][8 bytes], scales [n / 32][k / 16][32]
+			std::vector<uint8_t> hc( static_cast<size_t>( k ) * n / 2 ), hs( static_cast<size_t>( k ) * n / 16 );
+			for ( auto& v : hc ) v = static_cast<uint8_t>( rng() );
+			for ( auto& v : hs ) v = static_cast<uint8_t>( ( ( rng() & 1 ) << 7 ) | ( ( 5 + rng() % 5 ) << 3 ) | ( rng() & 7 ) );
+			int cs[3] = { n / 32, k / 16, 256 }, ss[3] = { n / 32, k / 16, 32 };
+			pod::TensorView codes = core::arena_alloc_tensor( arena, pod::DType::UINT8, cs, 3 );
+			pod::TensorView scales = core::arena_alloc_tensor( arena, pod::DType::UINT8, ss, 3 );
+			backend::memcpy_sync( codes.data, hc.data(), hc.size(), backend::Copy::H2D );
+			backend::memcpy_sync( scales.data, hs.data(), hs.size(), backend::Copy::H2D );
+			ws.push_back( pod::LinearWeight::make_nvfp4( codes, scales, 0.0625f ) );
+		}
+		for ( int c = 0; c < copies && !nvfp4; ++c ) {
 			for ( auto& v : host ) v = static_cast<uint16_t>( rng() );
 			int cs[3] = { k / 16, n / 16, modules::trellis_tile_u16( code ) };
 			pod::TensorView codes = core::arena_alloc_tensor( arena, pod::DType::UINT16, cs, 3 );
@@ -79,7 +94,7 @@ int main( int argc, char** argv ) {
 				backend::device_sync();
 				best = std::min( best, std::chrono::duration<double, std::micro>( std::chrono::steady_clock::now() - t0 ).count() / copies );
 			}
-			std::printf( "  %5d x %5d  rows %4d: %9.1f us  %7.1f GB/s of tiles\n", k, n, m, best, wbytes / best * 1e-3 );
+			std::printf( "  %5d x %5d  rows %4d: %9.1f us  %7.1f GB/s of %s\n", k, n, m, best, wbytes / best * 1e-3, nvfp4 ? "codes and scales" : "tiles" );
 		}
 	}
 	core::arena_destroy( arena );

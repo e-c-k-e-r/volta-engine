@@ -1,5 +1,6 @@
 // Vulkan backend: NVFP4 W4A16 linear on src/kernels/slang/nvfp4.slang, the prepacked fragment layout of src/loader/nvfp4.cpp. Up to 8 rows
-// nvfp4_gemv (a workgroup per 32-column tile, a lane per column, the weights decoded once per K group for every row); more the weight decoded
+// nvfp4_gemv1 / 2 / 4 / nvfp4_gemv (a workgroup per 32-column tile, a lane per column, the warps over contiguous slices of K, the weights decoded
+// once per K group for every row); more the weight decoded
 // to FP16 [n, k] (nvfp4_dequant, into a scratch) for llama.cpp's FP16 matmul. The weights are the CUDA kernels' FP16 ones (block scale
 // fp16( e4m3 * fp16( gscale * 2^14 ) ), weight fp16( e2m1 * scale ), both carried at 2^14), the sums FP32.
 #include "mod_common.h"
@@ -21,7 +22,7 @@ void LinearNVFP4::forward( const pod::TensorView& x, const pod::TensorView& code
 	const float gm = backend::to_float( backend::from_float_half( gscale * 16384.0f ) );
 	if ( m <= kGemvRows ) {
 		const Nvfp4GemvParams p{ vki::dp( codes.data ), vki::dp( scales.data ), vki::dp( x.data ), vki::dp( out.data ), m, k, n, gm };
-		vki::launch( "nvfp4_gemv", p, stream, static_cast<uint32_t>( n / 32 ) );
+		vki::launch( m == 1 ? "nvfp4_gemv1" : m == 2 ? "nvfp4_gemv2" : m <= 4 ? "nvfp4_gemv4" : "nvfp4_gemv", p, stream, static_cast<uint32_t>( n / 32 ) );
 		return;
 	}
 	void* w = vki::scratch( 4, static_cast<size_t>( k ) * n * 2, stream );

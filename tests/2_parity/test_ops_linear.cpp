@@ -158,7 +158,8 @@ int main( int argc, char** argv ) {
 		backend::memcpy_sync( codes.data, hc.data(), hc.size(), backend::Copy::H2D );
 		backend::memcpy_sync( scales.data, hs.data(), hs.size(), backend::Copy::H2D );
 		const pod::LinearWeight lw = pod::LinearWeight::make_nvfp4( codes, scales, 0.0625f );
-		for ( int m : row_list ) {
+		// every GEMV row form (Vulkan: 1, 2, 4 and 8 rows, rows past m reading the last row) and the dequantized path
+		for ( int m : { 1, 2, 3, 4, 6, 8, 40 } ) {
 			auto x = upload_half( uniform_vec( rng, static_cast<size_t>( m ) * k, 1.0f ), { m, k } );
 			int os[2] = { m, n };
 			pod::TensorView out = core::arena_alloc_tensor( g_arena, pod::DType::FP16, os, 2 );

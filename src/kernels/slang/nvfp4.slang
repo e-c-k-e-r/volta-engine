@@ -400,78 +400,117 @@ void nvfp4_moe_down_grp(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, un
 
 struct Nvfp4GemvParams { uint8_t* codes; uint8_t* scales; half* x; half* out_; int m; int k; int n; float gm; };
 
-static const int NVG_ROWS = 8;
-static const int NVG_CK = 1024;
-groupshared float4 s_xg[NVG_ROWS * NVG_CK / 4];
-groupshared float s_pg[NV_WARPS * 32 * NVG_ROWS];
+// ---- the GEMV of a decode or a verify block (up to NVG_ROWS rows, compiled for 1, 2, 4 and 8): a workgroup per 32-column tile, a lane per
+// column, warp w over a contiguous NVG_WARPS-th of the K groups, NVG_BATCH groups at a time: their codes and scales loaded together before
+// their math (the loads in flight are what reaches the memory's bandwidth), the warp's lanes converting the batch's activations of every row to
+// FP32 once into the warp's slice of shared memory, which every lane then reads as broadcasts. Rows past m re-read the last row, so the loop has
+// no branch on the row count; their sums are dropped. The same FP16 weights as nvfp4_gemm, FP32 sums, the warps' added in order. Shared memory
+// is NVG_WARPS * NVG_ROWS * 640 bytes (40 KB at 8 x 8): keep it within the 48 KB a workgroup has here
+#ifndef NVG_ROWS
+#define NVG_ROWS 8
+#endif
+#ifndef NVG_WARPS
+#define NVG_WARPS 8
+#endif
+static const int NVG_BATCH = 8;
+groupshared float s_pg[NVG_WARPS * NVG_ROWS * 32];
+groupshared float4 s_xw[NVG_WARPS * NVG_ROWS * 32];   // per warp and row: its batch's 128 K values
+
+// A lane's 16 FP16 weights of a K group (FP16, at 2^14), as eight pairs in K order: q its 16 nibbles (value 2 i + j of word h at bits 4 i + 16 j)
+void nvg_weights(uint2 q, uint sb, half gm, out float2 w[8]) {
+	let s = half(e4m3_value(sb)) * gm;
+	let s2 = half2(s, s);
+	[ForceUnroll]
+	for (int h = 0; h < 2; ++h) {
+		let cw = h == 0 ? q.x : q.y;
+		[ForceUnroll]
+		for (int i = 0; i < 4; ++i) {
+			let n = (cw >> uint(4 * i)) & 0x000F000Fu;
+			w[h * 4 + i] = float2(bit_cast<half2>(((n & 0x00070007u) << 9) | ((n & 0x00080008u) << 12)) * s2);
+		}
+	}
+}
+
+// One K group (group u of the warp's staged batch) into the rows' sums
+void nvg_step_staged(uint2 q, uint sb, half gm, int base, int u, inout float acc[NVG_ROWS]) {
+	float2 w[8];
+	nvg_weights(q, sb, gm, w);
+	[ForceUnroll]
+	for (int r = 0; r < NVG_ROWS; ++r) {
+		float a = acc[r];
+		[ForceUnroll]
+		for (int j = 0; j < 4; ++j) {
+			let xv = s_xw[base + r * 32 + u * 4 + j];
+			a = fma(xv.x, w[2 * j].x, fma(xv.y, w[2 * j].y, a));
+			a = fma(xv.z, w[2 * j + 1].x, fma(xv.w, w[2 * j + 1].y, a));
+		}
+		acc[r] = a;
+	}
+}
 
 [shader("compute")]
-[numthreads(256, 1, 1)]
+[numthreads(NVG_WARPS * 32, 1, 1)]
 void nvfp4_gemv(uint3 gid : SV_GroupID, uint3 tid : SV_GroupThreadID, uniform Nvfp4GemvParams p) {
 	let t = int(tid.x);
 	let lane = t & 31;
 	let warp = t >> 5;
 	let tile = int(gid.x);
 	let G = p.k / 16;
+	let per = (G + NVG_WARPS - 1) / NVG_WARPS;
+	let g0 = min(G, warp * per);
+	let g1 = min(G, g0 + per);
 	let off = int64_t(tile) * G * 32 + lane;
 	let gm = half(p.gm);
+	uint2* codes = (uint2*)p.codes;
+	half* xr[NVG_ROWS];
 	float acc[NVG_ROWS];
 	[ForceUnroll]
-	for (int r = 0; r < NVG_ROWS; ++r) acc[r] = 0.0f;
-	for (int k0 = 0; k0 < p.k; k0 += NVG_CK) {
-		let ck = min(NVG_CK, p.k - k0);
-		for (int i = t; i < p.m * (ck / 4); i += 256) {
-			let r = i / (ck / 4);
-			let c4 = i % (ck / 4);
-			let w = loadAligned<8>((uint2*)(p.x + int64_t(r) * p.k + k0) + c4);
-			let a = float2(bit_cast<half2>(w.x));
-			let b = float2(bit_cast<half2>(w.y));
-			s_xg[r * (NVG_CK / 4) + c4] = float4(a.x, a.y, b.x, b.y);
+	for (int r = 0; r < NVG_ROWS; ++r) {
+		xr[r] = p.x + int64_t(min(r, p.m - 1)) * p.k;
+		acc[r] = 0.0f;
+	}
+	let base = warp * NVG_ROWS * 32;
+	for (int g = g0; g < g1; g += NVG_BATCH) {
+		let nb = min(NVG_BATCH, g1 - g);
+		uint2 q[NVG_BATCH];
+		uint sb[NVG_BATCH];
+		[ForceUnroll]
+		for (int u = 0; u < NVG_BATCH; ++u) {
+			let gg = int64_t(min(g + u, g1 - 1));
+			q[u] = loadAligned<8>(codes + off + gg * 32);
+			sb[u] = uint(p.scales[off + gg * 32]);
 		}
-		GroupMemoryBarrierWithGroupSync();
-		for (int g = k0 / 16 + warp; g < (k0 + ck) / 16; g += NV_WARPS) {
-			let q = loadAligned<8>((uint2*)p.codes + off + int64_t(g) * 32);
-			let s = half(e4m3_value(uint(p.scales[off + int64_t(g) * 32]))) * gm;
-			let s2 = half2(s, s);
-			float4 wv[4];
-			[ForceUnroll]
-			for (int h = 0; h < 2; ++h) {
-				let cw = h == 0 ? q.x : q.y;
-				[ForceUnroll]
-				for (int i = 0; i < 4; i += 2) {
-					let n0 = (cw >> uint(4 * i)) & 0x000F000Fu;
-					let n1 = (cw >> uint(4 * i + 4)) & 0x000F000Fu;
-					let w0 = float2(bit_cast<half2>(((n0 & 0x00070007u) << 9) | ((n0 & 0x00080008u) << 12)) * s2);
-					let w1 = float2(bit_cast<half2>(((n1 & 0x00070007u) << 9) | ((n1 & 0x00080008u) << 12)) * s2);
-					wv[h * 2 + (i >> 1)] = float4(w0.x, w0.y, w1.x, w1.y);
-				}
+		// the batch's K values 4 lane .. 4 lane + 3 of every row (zero past the batch's groups)
+		[ForceUnroll]
+		for (int r = 0; r < NVG_ROWS; ++r) {
+			float4 v = float4(0.0f, 0.0f, 0.0f, 0.0f);
+			if (lane * 4 < nb * 16) {
+				let w = loadAligned<8>((uint2*)(xr[r] + int64_t(g) * 16 + lane * 4));
+				let a = float2(bit_cast<half2>(w.x));
+				let b = float2(bit_cast<half2>(w.y));
+				v = float4(a.x, a.y, b.x, b.y);
 			}
-			let c4 = (g * 16 - k0) / 4;
-			[ForceUnroll]
-			for (int r = 0; r < NVG_ROWS; ++r) {
-				if (r < p.m) {
-					float a = acc[r];
-					[ForceUnroll]
-					for (int u = 0; u < 4; ++u) {
-						let xv = s_xg[r * (NVG_CK / 4) + c4 + u];
-						a = fma(xv.x, wv[u].x, fma(xv.y, wv[u].y, fma(xv.z, wv[u].z, fma(xv.w, wv[u].w, a))));
-					}
-					acc[r] = a;
-				}
-			}
+			s_xw[base + r * 32 + lane] = v;
 		}
-		GroupMemoryBarrierWithGroupSync();   // the next chunk rewrites the rows
+		GroupMemoryBarrierWithWaveSync();
+		[ForceUnroll]
+		for (int u = 0; u < NVG_BATCH; ++u) {
+			if (u < nb) nvg_step_staged(q[u], sb[u], gm, base, u, acc);
+		}
+		GroupMemoryBarrierWithWaveSync();   // the next batch rewrites the slice
 	}
 	[ForceUnroll]
-	for (int r = 0; r < NVG_ROWS; ++r) s_pg[(warp * 32 + lane) * NVG_ROWS + r] = acc[r];
+	for (int r = 0; r < NVG_ROWS; ++r) s_pg[(warp * NVG_ROWS + r) * 32 + lane] = acc[r];
 	GroupMemoryBarrierWithGroupSync();
-	if (t < 32 * p.m) {
-		let r = t >> 5;
-		let l = t & 31;
-		float v = 0.0f;
-		[ForceUnroll]
-		for (int w = 0; w < NV_WARPS; ++w) v += s_pg[(w * 32 + l) * NVG_ROWS + r];
-		p.out_[int64_t(r) * p.n + tile * 32 + nv_lane_col(l)] = half(v);
+	for (int e = t; e < NVG_ROWS * 32; e += NVG_WARPS * 32) {
+		let r = e >> 5;
+		let l = e & 31;
+		if (r < p.m) {
+			float v = 0.0f;
+			[ForceUnroll]
+			for (int w = 0; w < NVG_WARPS; ++w) v += s_pg[(w * NVG_ROWS + r) * 32 + l];
+			p.out_[int64_t(r) * p.n + tile * 32 + nv_lane_col(l)] = half(v);
+		}
 	}
 }
 

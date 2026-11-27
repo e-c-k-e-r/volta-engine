@@ -161,6 +161,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			COMMENT "slangc ${entry} -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
 	endforeach()
+	# nvfp4_gemv also for 1, 2 and 4 rows (nvfp4_gemv1 / 2 / 4; nvfp4_gemv is the 8-row form)
+	foreach(vrows 1 2 4)
+		set(sout ${SLANG_OUT}/nvfp4_gemv${vrows}.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${SLANGC} ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang -target spirv -stage compute -entry nvfp4_gemv -DENGINE_TARGET_CPU=0 -DNVG_ROWS=${vrows} -o ${sout}
+			DEPENDS ${PROJECT_SOURCE_DIR}/src/kernels/slang/nvfp4.slang
+			COMMENT "slangc nvfp4_gemv (${vrows} rows) -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
+	endforeach()
 	# GGUF block weights (src/kernels/slang/gguf.slang)
 	foreach(entry gguf_gemv_sg gguf_quantize_q8 gguf_gemm_tile gguf_dequant gguf_permute_rows gguf_quantize_q8_1x4 moe_local_ids moe_row_map)
 		set(sout ${SLANG_OUT}/${entry}.spv)
