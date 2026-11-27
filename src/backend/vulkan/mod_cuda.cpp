@@ -1,7 +1,8 @@
 // Vulkan backend: the tensor-core path of NVIDIA GPUs without cooperative matrices (Volta). The FP16 GEMMs and the NVFP4 linears up to
 // mid-size chunks run the CUDA backend's kernels (src/kernels/cuda/gemm/gemm_f16_kernel.cuh, src/kernels/cuda/nvfp4/nvfp4_linear_kernels.cuh;
 // the PTX entry points of gemm_f16_vk.cu and nvfp4_vk.cu, <kernel dir>/cuda_gemm.ptx and cuda_nvfp4.ptx) launched from the command buffers
-// through VK_NV_cuda_kernel_launch, with gemm_f16.cu's tiles by row count and its split along k and skinny_kernels.cu's kernel by row count.
+// through VK_NV_cuda_kernel_launch, with gemm_f16.cu's tiles by row count and its split along k and skinny_kernels.cu's kernel by row count;
+// the prefill attention runs src/kernels/cuda/attention/attn_prefill_vk.cu (cuda_attn.ptx), sized for a launch's 48 KiB of shared memory.
 // Devices with cooperative matrices would take shaders of their own beside this (tensor_path); the others keep the shader-core kernels.
 #include "mod_common.h"
 #include <algorithm>
@@ -113,6 +114,19 @@ bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k,
 		const int quads = m * ( ( n + 3 ) / 4 );
 		vk::cuda_launch( stream, reduce, static_cast<uint32_t>( ( quads + 255 ) / 256 ), 1, 1, 256, 1, 1, 0, rparams, 7 );
 	}
+	return true;
+}
+
+bool cuda_attn_prefill( const AttnPrefillArgs& a, stream_t stream ) {
+	if ( tensor_path() != TensorPath::CudaLaunch || ( a.head_dim != 256 && a.head_dim != 512 ) || a.num_kv_heads <= 0 || a.num_q_heads % a.num_kv_heads != 0 ) return false;
+	vk::CudaFunction* fn = function( a.head_dim == 256 ? "vk_attn_prefill_256" : "vk_attn_prefill_512", "cuda_attn" );
+	if ( fn == nullptr ) return false;
+	const int G = a.num_q_heads / a.num_kv_heads;
+	const void* params[20] = { &a.q, &a.k, &a.v, &a.gate, &a.out, &a.slot_stride, &a.layer_idx, &a.rows_slot, &a.rows_pos, &a.rows_key_end, &a.rows_bidir,
+		&a.count, &a.num_q_heads, &a.num_kv_heads, &a.max_seq, &a.scale, &a.part, &a.splits, &a.window, &a.ring };
+	// attn_prefill_vk.cu's 32 query vectors a block, 256 threads, its 46976 bytes of shared memory
+	vk::cuda_launch( stream, fn, static_cast<uint32_t>( a.num_kv_heads ), static_cast<uint32_t>( ( a.count * G + 31 ) / 32 ), static_cast<uint32_t>( a.splits ),
+		256, 1, 1, 46976, params, 20 );
 	return true;
 }
 

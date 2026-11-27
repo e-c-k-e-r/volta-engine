@@ -17,6 +17,10 @@ void reference( const pod::KVRef& kv, const pod::TensorView& q, const pod::Tenso
 void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window,
 	bool one_slot, int key_hint );
+// The tensor-core prefill attention of the CUDA launch path (rows of one slot, FP16 caches, head_dim 256 or 512); false where it does not apply
+bool tensor_core( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
+	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window,
+	int key_hint );
 
 // Bidirectional attention outside a cache (fa_attn without slots): q / out [rows][num_q_heads][head_dim] against every key of k / v
 // [keys][num_kv_heads][head_dim]

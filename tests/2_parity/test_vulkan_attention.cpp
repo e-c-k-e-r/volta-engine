@@ -1,7 +1,8 @@
 // The Vulkan backend's tiled attention (fa.slang) against its portable reference kernel (ref_attention.slang) on the same device, over the
 // cases the models give it: head_dim 128, 256 and 512; 1 to 8 query heads per KV head; decode rows in distinct slots, decode rows of one slot,
 // and prefill chunks; full attention, and sliding windows on ring caches; image rows that see past their position; every KV format; with
-// and without a gate. Each case: the relative RMS of the two outputs (the tiled kernel's FP16 dot products: well under 5e-3).
+// and without a gate. Each case: the relative RMS of the two outputs (the tiled kernel's FP16 dot products: well under 5e-3); rows of one slot
+// also on the tensor-core prefill attention where the device launches CUDA kernels (its cases: FP16 caches, head_dim 256 and 512).
 //   test_vulkan_attention
 #include "../../src/backend/vulkan/mod_attention.h"
 #include "engine/backend/runtime.h"
@@ -149,19 +150,35 @@ bool run( const Case& c ) {
 		return std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() / 10.0;
 	};
 	const double ms_ref = timed( ref ), ms = timed( fa );
-	const std::vector<float> a = down( o_ref, qn ), b = down( o_fa, qn );
-	double e = 0.0, r = 0.0, mx = 0.0;
-	bool finite = true;
-	for ( size_t i = 0; i < qn; ++i ) {
-		finite = finite && std::isfinite( b[i] );
-		const double d = static_cast<double>( b[i] ) - a[i];
-		e += d * d;
-		r += static_cast<double>( a[i] ) * a[i];
-		mx = std::max( mx, std::fabs( d ) );
+	const std::vector<float> a = down( o_ref, qn );
+	auto check = [&]( const half_t* o, double ms_o, const char* name ) {
+		const std::vector<float> b = down( o, qn );
+		double e = 0.0, r = 0.0, mx = 0.0;
+		bool finite = true;
+		for ( size_t i = 0; i < qn; ++i ) {
+			finite = finite && std::isfinite( b[i] );
+			const double d = static_cast<double>( b[i] ) - a[i];
+			e += d * d;
+			r += static_cast<double>( a[i] ) * a[i];
+			mx = std::max( mx, std::fabs( d ) );
+		}
+		const double rel = std::sqrt( e / std::max( r, 1e-30 ) );
+		const bool ok = finite && rel < 5e-3;
+		std::printf( "  %-44s rel %.2e max|d| %.3e  %8.3f ms (reference %8.3f)  %s\n", name, rel, mx, ms_o, ms_ref, ok ? "PASS" : "FAIL" );
+		return ok;
+	};
+	bool ok = check( o_fa, ms, c.name );
+	// the tensor-core prefill attention where the rows share a slot and the device launches CUDA kernels
+	if ( one_slot ) {
+		half_t* o_tc = static_cast<half_t*>( dev( qn * sizeof( half_t ) ) );
+		pod::TensorView tt = pod::make_tensor_2d( o_tc, pod::DType::FP16, c.count, c.hq * c.hd );
+		auto tc = [&]() { return modules::vk_attn::tensor_core( kv, tq, tg, tt, slot_stride, kLayer, drows, c.count, c.hq, c.hkv, c.hd, c.max_seq, nullptr, scale, c.window, key_hint ); };
+		if ( tc() ) {
+			const double ms_tc = timed( tc );
+			const std::string name = std::string( c.name ) + ", tensor cores";
+			ok = check( o_tc, ms_tc, name.c_str() ) && ok;
+		}
 	}
-	const double rel = std::sqrt( e / std::max( r, 1e-30 ) );
-	const bool ok = finite && rel < 5e-3;
-	std::printf( "  %-44s rel %.2e max|d| %.3e  %8.3f ms (reference %8.3f)  %s\n", c.name, rel, mx, ms, ms_ref, ok ? "PASS" : "FAIL" );
 	for ( void* p : g_allocs ) backend::device_free( p );
 	g_allocs.clear();
 	return ok;
@@ -185,6 +202,8 @@ int main() {
 		{ "prefill 40, 24/4 x 256", 256, 24, 4, 1024, false, 0, F::FP16, Rows::Prefill, 40, 20, true, false },
 		{ "decode 2 slots, 32/4 x 512", 512, 32, 4, 2048, false, 0, F::FP16, Rows::Slots, 2, 0, false, false },
 		{ "prefill 100, 32/4 x 512", 512, 32, 4, 2048, false, 0, F::FP16, Rows::Prefill, 100, 900, false, false },
+		{ "prefill 500, 6/1 x 256 from 0, gate", 256, 6, 1, 4096, false, 0, F::FP16, Rows::Prefill, 500, 0, true, false },
+		{ "prefill 500, 6/1 x 256 at 3000, gate", 256, 6, 1, 4096, false, 0, F::FP16, Rows::Prefill, 500, 3000, true, false },
 		{ "prefill 64 image rows, window 512 ring 1024", 256, 8, 2, 1024, true, 512, F::FP16, Rows::Prefill, 64, 2000, false, true },
 		{ "decode 3 slots, fp8", 256, 8, 2, 2048, false, 0, F::FP8, Rows::Slots, 3, 0, true, false },
 		{ "decode 3 slots, k8v4", 256, 8, 2, 2048, false, 0, F::K8V4, Rows::Slots, 3, 0, true, false },

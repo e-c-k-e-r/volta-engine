@@ -67,8 +67,8 @@ They run the portable parts on reference kernels (GGUF projections on llama.cpp'
   is eager); Flash-Next needs four devices. Models with trellis or FP16 routed experts need eager execution on one device (`--set no_graphs=true`;
   that MoE reads its routes back on the host; resident GGUF experts stay on the device; with `tp` above 1 graphs are off anyway)
 * on NVIDIA GPUs whose Vulkan driver launches CUDA kernels (`VK_NV_cuda_kernel_launch`) but has no cooperative matrices (Volta), the Vulkan
-  build runs its FP16 matmuls (GGUF prefill chunks among them, the weight dequantized in slices) and its NVFP4 linears on the CUDA backend's
-  tensor-core kernels, built as PTX where nvcc is found at configure time (the driver loads it; no CUDA library is linked);
+  build runs its FP16 matmuls (GGUF prefill chunks among them, the weight dequantized in slices), its NVFP4 linears and the prefill attention
+  on FP16 caches on tensor-core CUDA kernels, built as PTX where nvcc is found at configure time (the driver loads it; no CUDA library is linked);
   `--set vk_cuda_launch=false` keeps them on the shader cores
 * the routed experts are all resident (no expert tier); the MTP head runs on both (`test_mtp` passes the 27B GGUF on CPU and Vulkan)
 * DeepSeek-V4.1, the DFlash / DFlash2 / DSpark drafters and MiniMax-H3 are CUDA only (the ROCm build compiles MiniMax-H3 but does not run it,

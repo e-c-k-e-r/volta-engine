@@ -151,6 +151,35 @@ void tiled( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorVie
 	else if ( q4 ) vki::launch( "fa_finish", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );
 }
 
+// Rows of one slot on the CUDA launch path (Volta): the tensor-core prefill attention for FP16 caches with head_dim 256 or 512 and more query
+// vectors than fa_decode takes. Its key tiles go to extra blocks while the query tiles alone leave the GPU under a wave (the CUDA backend's
+// choice, bounded by what the keys reach and by the partials' scratch), merged by fa_reduce. False where it does not apply
+bool tensor_core( const pod::KVRef& kv, const pod::TensorView& q, const pod::TensorView& gate, pod::TensorView& out, size_t slot_stride, int layer_idx,
+	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, float scale, int window,
+	int key_hint ) {
+	if ( vki::tensor_path() != vki::TensorPath::CudaLaunch || kv.kq != pod::KVQ::F16 || kv.vq != pod::KVQ::F16 || ( head_dim != 256 && head_dim != 512 ) ) return false;
+	if ( num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0 ) return false;
+	const int G = num_q_heads / num_kv_heads, vectors = head_dim == 256 ? 8 : 4;
+	if ( count * G <= 2 * vectors ) return false;   // fa_decode's
+	if ( window > 0 ) key_hint = key_hint > 0 ? std::min( key_hint, window + count ) : window + count;
+	const int base = num_kv_heads * ( ( count * G + 31 ) / 32 );
+	int splits = base < kTargetGroups ? std::min( ( 2 * kTargetGroups + base - 1 ) / base, 32 ) : 1;
+	if ( key_hint > 0 ) splits = std::max( 1, std::min( splits, key_hint / ( 4 * 32 ) ) );
+	const size_t per_split = static_cast<size_t>( count ) * num_q_heads * ( head_dim + 2 ) * sizeof( float );
+	splits = std::max( 1, std::min( { splits, kMaxSplits, static_cast<int>( kFaScratch / per_split ) } ) );
+	float* part = splits > 1 ? static_cast<float*>( vki::scratch( 40, kFaScratch, stream ) ) : nullptr;
+	const vki::AttnPrefillArgs a{ q.data, kv.k, kv.v, gate.data, out.data, static_cast<long long>( slot_stride ), layer_idx, vki::rows_slot( d_rows ),
+		vki::rows_pos( d_rows ), vki::rows_key_end( d_rows ), vki::rows_bidir( d_rows ), count, num_q_heads, num_kv_heads, max_seq,
+		scale > 0.0f ? scale : 1.0f / std::sqrt( static_cast<float>( head_dim ) ), part, splits, window, kv.ring, head_dim };
+	if ( !vki::cuda_attn_prefill( a, stream ) ) return false;
+	if ( splits > 1 ) {
+		const vki::FaReduceParams r{ vki::dp( part ), vki::dp( gate.data ), vki::dp( out.data ), count, num_q_heads, head_dim, splits, gate.data != nullptr ? 1 : 0,
+			static_cast<int>( kv.vq ) };
+		vki::launch( "fa_reduce", r, stream, static_cast<uint32_t>( num_q_heads ), static_cast<uint32_t>( count ) );
+	}
+	return true;
+}
+
 // head_dim 64: fa_dense_64 (a thread per query, 32 a workgroup); else fa_attn without slots, up to 16 query vectors a workgroup, the splits as
 // tiled's (their partials in a scratch of their own: the callers are the TTS and vision towers, which may run beside a language model's forward)
 void dense( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out, int rows, int keys, int num_q_heads, int num_kv_heads,
@@ -203,7 +232,9 @@ void Attention::forward_prefill( const pod::KVRef& kv, const pod::TensorView& q,
 	const pod::BatchRows* d_rows, int count, int num_q_heads, int num_kv_heads, int head_dim, int max_seq, backend::stream_t stream, int key_hint, bool per_row, float scale,
 	int window ) {
 	if ( attn_ref() ) vk_attn::reference( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window );
-	else vk_attn::tiled( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window, !per_row, key_hint );
+	else if ( per_row || !vk_attn::tensor_core( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale,
+				 window, key_hint ) )
+		vk_attn::tiled( kv, q, gate, out, slot_stride, layer_idx, d_rows, count, num_q_heads, num_kv_heads, head_dim, max_seq, stream, scale, window, !per_row, key_hint );
 }
 
 void Attention::unpack_q_gate( const pod::TensorView& q_gate, pod::TensorView& q, pod::TensorView& gate, int num_q_heads, int head_dim, backend::stream_t stream ) {
