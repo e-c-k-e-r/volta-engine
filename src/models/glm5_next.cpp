@@ -881,7 +881,7 @@ bool Glm5NextPipeline::load_weights( const char* model_dir, backend::stream_t st
 		++nv_count;
 		return lw;
 	};
-	// Calibrated tensors (tests/tools/nvfp4_ldlq.py --model glm) when the directory has them, otherwise round-to-nearest from the BF16 weight
+	// Calibrated tensors (volta_nvfp4 --model glm) when the directory has them, otherwise round-to-nearest from the BF16 weight
 	std::unique_ptr<engine::loader::SafeTensorsRepo> ov_repo;
 	if ( const std::string& ov_dir = runtime::options().nvfp4_dense_dir; !ov_dir.empty() && nv_repo ) {
 		ov_repo = std::make_unique<engine::loader::SafeTensorsRepo>();

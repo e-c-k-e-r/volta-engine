@@ -20,7 +20,7 @@ struct Hessian {
 };
 
 // The accumulators of one model: `stride` sites per layer, each a k x k fp32 matrix in the arena, summed over the prefill rows that ran.
-// One file per site at dump(): int32 magic, int32 k, int64 rows, then k * k fp32; named L<layer>_s<site>_r<rank>.f32 (what tests/tools/nvfp4_ldlq.py and
+// One file per site at dump(): int32 magic, int32 k, int64 rows, then k * k fp32; named L<layer>_s<site>_r<rank>.f32 (what volta_nvfp4 and
 // exl3_quantize.py read). A model declares the sites that exist on its rank with add(); accumulate() ignores the others and the decode-sized rows.
 class HessianSet {
 public:

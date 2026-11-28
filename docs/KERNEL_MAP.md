@@ -25,6 +25,7 @@ the tests are described in [TESTS.md](TESTS.md). `gate.sh sass` fingerprints eve
 | `nvfp4_linear_kernels.cuh`, `skinny_kernels.cu`, `nvfp4_common.cuh`, `nvfp4_frag.h` | skinny (M <= 32) and fused-GEMM kernels with FP16-rounded dequant, the dequantization into FP16 for the GEMM of larger chunks (a row's 64 weights per 128-byte store, staged in shared memory), plus the `LinearNVFP4` module entry in skinny_kernels.cu (CPU has a mirrored implementation) | `test_nvfp4_linear`, `test_ops_linear`, `bench_nvfp4_shapes`, `test_mma_frag` |
 | `nvfp4_vk.cu` | the same kernels as PTX entry points with C names (`cuda_nvfp4.ptx`, beside `cuda_gemm.ptx`) for the Vulkan backend's CUDA launches below the dequantized chunks, skinny_kernels.cu's choice by row count | `test_ops_linear` (Vulkan build) |
 | `moe_kernels.cu` | fused routed experts: dispatch by expert, gate / up / SiLU, down + ordered weighted sum; up to 8 rows per pass of an expert's weights | `bench_nvfp4_moe` (parity with the chained calls), `test_cpu_nvfp4_vs_gpu` |
+| `quant/nvfp4_quantize.cu` | the NVFP4 quantizer (`engine_quant`): block LDL of the damped mean Hessian (cuSOLVER, double), the 16-row blocks with the error feedback (SGEMM) and a column-per-thread block quantizer with the scale search, proxy errors, modelopt packing | `test_nvfp4_ldlq` |
 
 ## GGUF weights
 

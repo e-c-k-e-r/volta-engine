@@ -10,7 +10,7 @@ The weight formats the engine reads, the checkpoints at how many bits and what t
   DeepSeek-V4.1 packs may give each of an expert's three projections its own width (1 to 4 bits).
 * **NVFP4** (modelopt, compressed-tensors): E2M1 values with an E4M3 scale per 16 and one FP32 scale per matrix. Software-unpacked on Volta (no FP4 hardware). Either
   read from a checkpoint (the routed experts, or a whole NVFP4 checkpoint), or made at load by the engine's quantizer from BF16 tensors (round to nearest with a +-2
-  code search per block, or the calibrated tensors from `tests/tools/nvfp4_ldlq.py`). FP8 sources (the Flash-Next MTP experts: E4M3 with 128 x 128 block scales)
+  code search per block, or the calibrated tensors from `volta_nvfp4`). FP8 sources (the Flash-Next MTP experts: E4M3 with 128 x 128 block scales)
   are dequantized first. See [NVFP4](#nvfp4).
 * **GGUF** (llama.cpp's block formats): see [GGUF](#gguf).
 * **FP8** with block scales: DeepSeek-V4.1 packs that keep the original FP8 attention, shared-expert and indexer weights (E4M3 with E8M0 scales) hold them FP8 in
@@ -112,14 +112,15 @@ the BF16 ones. `Qwen3.8-27B-QUASAR-NVFP4` runs as it is (`configs/qwen_nvfp4.jso
 * `nvfp4_dense=<groups>` quantizes dense groups at load (`gdn`, `attn`, `idx`, `head`, `shared_gate`, `shared_up`, `shared_down`, `shared`, `all`) from the BF16
   tensors of the NVFP4 checkpoint: per 16 values the E4M3 scale nearest to amax / 6 and its +-2 code neighbours are tried, one global scale per tensor.
   `nvfp4_dense_dir=<dir>` loads calibrated tensors instead, for the groups they cover.
-* Recommended: `nvfp4_experts` + `nvfp4_dense=gdn,attn,idx,head,shared_gate,shared_up` + the calibrated directory (`configs/flash_next_nvfp4.json`). `shared_down`
-  stays on the 8-bit trellis tensor: it costs +0.016 perplexity in every variant tried (round to nearest, calibrated, the BF16 original as FP16).
+* With an EXL3 model directory and `nvfp4_experts`: `nvfp4_dense=gdn,attn,idx,head,shared_gate,shared_up` with the calibrated directory. `shared_down` stays on
+  the 8-bit trellis tensor: it costs +0.016 perplexity in every variant tried (round to nearest, calibrated, the BF16 original as FP16).
 * MTP head (`mtp_nvfp4=true`, needs `nvfp4_experts`): read from the NVFP4 checkpoint instead of the model directory. Its 512 experts are FP8 E4M3 with 128 x 128
   block scales (`model-fp8-mtp-ple.safetensors`) and everything else is BF16; the experts are dequantized and quantized to NVFP4 at load (round to nearest), the
   dense tensors go through the same quantizer as the trunk's dense groups. `mtp_head_dir=<dir>` takes the head from such a checkpoint while the model's own
   weights, routed experts included, stay as they are.
-* Only the NVFP4 checkpoint (nothing from a conversion): `model_dir` and `nvfp4_experts` both point at `Qwen3.8-Flash-Next-NVFP4`, with `nvfp4_dense=all` and
-  `mtp_nvfp4=true` (`configs/flash_next_nvfp4_only.json`, round to nearest; `nvfp4_dense_dir` adds the calibrated tensors). The small tensors (embeddings, norms,
+* Only the NVFP4 checkpoint (nothing from a conversion): `model_dir` and `nvfp4_experts` both point at `Qwen3.8-Flash-Next-NVFP4`, with `nvfp4_dense=all`,
+  `nvfp4_dense_dir=Qwen3.8-Flash-Next-NVFP4-dense` (the calibrated tensors, below) and `mtp_nvfp4=true` (`configs/flash_next_nvfp4_only.json`; the MTP head's
+  dense tensors are rounded to nearest). The small tensors (embeddings, norms,
   router, gated-residual weights, PLE projections) are the same bytes as in the conversions, the dense groups are quantized to NVFP4 at load and the router is
   converted from BF16. The n-gram (PLE) table is read in place from the FP8 shards of `model-fp8-mtp-ple.safetensors` (51 GB against the conversion's 39 GB; 128
   shards of 160-wide rows, one BF16 `weight_scale`, no bias), memory-mapped like the conversion's file.
@@ -136,10 +137,37 @@ the BF16 ones. `Qwen3.8-27B-QUASAR-NVFP4` runs as it is (`configs/qwen_nvfp4.jso
 
 `ENGINE_HESSIAN_DIR=<dir> test_ppl --model qwen4_exp|glm5_next --calibrate --file <text> --tokens N` (with `ENGINE_MAX_SEQ` above N; GLM a third of the layers per pass with
 `ENGINE_HESSIAN_LAYERS=lo-hi`) accumulates x^T x of every dense projection input and writes one file per site (the capture is described below).
-`tests/tools/nvfp4_ldlq.py --src <BF16 source> --hess <dir> --out <dir> --model flash|glm [--groups ...] [--layers ...] [--tp 4] [--rtn]` then runs block LDLQ
-(damping 2.5% of the mean diagonal, Cholesky, 16-row blocks from the last to the first with the propagated error, the NVFP4 tile quantizer in place of the trellis
-one, no Hadamard rotation; row-parallel inputs use the per-rank Hessians as a block diagonal) and writes a `*-NVFP4-dense` directory of modelopt-named tensors (8
-layers per file: the loader opens at most 128 shard files), which `nvfp4_dense_dir` loads. The proxy error falls 3 to 10 times against round to nearest.
+`volta_nvfp4 --src <NVFP4 checkpoint> --hess <dir> --out <dir> [--model flash|glm] [--groups ...] [--layers lo-hi] [--tp 4] [--devices 0,1,2,3] [--rtn]` then runs
+block LDLQ on the GPUs (`engine/quant/nvfp4_quantize.h`: damping 2.5% of the mean diagonal, a Cholesky factor in double, 16-row blocks from the last to the first
+with the propagated error, each column's E4M3 scale searched over the two codes either side of the nearest to amax / 6, no Hadamard rotation; row-parallel inputs
+use the per-rank Hessians as a block diagonal; GLM's q / k / v share one global scale) and writes a `*-NVFP4-dense` directory of modelopt-named tensors (8 layers
+per file: the loader opens at most 128 shard files), which `nvfp4_dense_dir` loads. `test_nvfp4_ldlq` holds the quantizer against a host restatement.
+
+`Qwen3.8-Flash-Next-NVFP4-dense` (the directory the Flash-Next NVFP4 configurations name) holds every dense group of `Qwen3.8-Flash-Next-NVFP4`, calibrated on
+262,144 tokens in 2048-token rows of exllamav3's calibration texts (c4, code, multilingual, technical, wiki, tiny) interleaved with C++ sources, documentation
+and an agent transcript; the 313 tensors take under a minute on four GPUs. The proxy error falls 1.8 to 2 times against round to nearest on most projections,
+3.7 times on the GDN `out_proj` and 16 times on the attention `o_proj` (means over the layers).
+
+### Flash-Next dense groups against FP16
+
+`test_ear --model qwen4_exp --compare` with `Qwen3.8-Flash-Next-NVFP4` as the reference (its dense tensors FP16, the default load): the reference's own answers
+to `tests/data/ear_prompts.json` (30 samples, 20,792 tokens; T 1.0, top-p 0.95, top-k 20, seed 1), 16 rows per teacher-forced forward. M=1 decode is
+`bench_decode` at tensor-parallel 4 (FP16 dense: 10.4 ms).
+
+| `nvfp4_dense` | Tensors | EAR | KLD | Top-1 | M=1 decode |
+|---|---|---|---|---|---|
+| `shared` | round to nearest | 0.9844 | 0.0030 | 98.2% | 10.3 ms |
+| `head` | round to nearest | 0.9789 | 0.0052 | 97.4% | 10.3 ms |
+| `gdn` | round to nearest | 0.9722 | 0.0099 | 97.0% | 9.8 ms |
+| `attn` | round to nearest | 0.9559 | 0.0253 | 95.3% | 10.3 ms |
+| `gdn,shared,head` | round to nearest | 0.9621 | 0.0174 | 95.9% | 9.2 ms |
+| `gdn,shared,head` | calibrated | 0.9722 | 0.0092 | 96.9% | 9.2 ms |
+| `all` | round to nearest | 0.9424 | 0.0418 | 93.7% | 8.8-9.2 ms |
+| `all` | calibrated | 0.9691 | 0.0115 | 96.5% | 8.8-9.2 ms |
+| `all` but `shared_down` | calibrated | 0.9695 | 0.0112 | 96.7% | 8.9-9.3 ms |
+
+By kind, `all` round to nearest against calibrated: agentic 0.9274 / 0.9617, chat 0.9187 / 0.9566, code 0.9481 / 0.9741, math 0.9797 / 0.9891, multilingual
+0.9421 / 0.9658. The decode gains do not add up group by group: `shared` and `head` alone save under 1% each, together 4.5%.
 
 ## Perplexity
 
@@ -180,7 +208,7 @@ The speed side of the same configurations is in [PERFORMANCE.md](PERFORMANCE.md)
 | `shared` | 1.805 |
 | `kda` | 1.808 |
 | all of `kda,mla,idx,head,dense,shared`, round to nearest | 1.812 |
-| all, calibrated (`nvfp4_ldlq.py --model glm`, `ENGINE_HESSIAN_LAYERS=lo-hi` in three passes) | 1.804 |
+| all, calibrated (`--model glm`, `ENGINE_HESSIAN_LAYERS=lo-hi` in three passes) | 1.804 |
 
 Against the original FP8 checkpoint (`test_ppl --model glm5_next --tokens 8192 --chunk 512` on the default text, the docs/ folder as of commit c233440, prefill windows
 of 8 chunks, `glm_logit_rows=4096`): the FP8 model 1.3846 NLL, the EXL3 3.05 bpw copy 1.3979, KL( FP8 || 3.05 ) 0.0414 per token over the FP8 model's top 128.

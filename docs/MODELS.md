@@ -156,7 +156,7 @@ The final mixer is the same without `post` and gives the head's input.
     tower) as FP16, and the MTP head's FP8 experts are quantized to NVFP4 at load; `nvfp4_dense=<groups>` quantizes dense groups (and with `all`
     the MTP head's) to NVFP4 instead (`configs/flash_next_nvfp4_only.json`: `all`, the smallest). The n-gram table is read in place from its FP8 shards.
   * GGUF: llama.cpp's `qwen4exp` architecture. Its MTP block is not read; `mtp_head_dir=<NVFP4 dir>` takes the head from the NVFP4 checkpoint.
-  * calibrated NVFP4 dense tensors come from `tests/tools/nvfp4_ldlq.py --model flash|glm` over the Hessians that
+  * calibrated NVFP4 dense tensors come from `volta_nvfp4 --model flash|glm` over the Hessians that
     `ENGINE_HESSIAN_DIR=<dir> test_ppl --model qwen4_exp|glm5_next --calibrate --file <text>` writes (GLM: `ENGINE_HESSIAN_LAYERS=lo-hi`, a third of the layers per pass).
 * Speculation: `--speculative --set speculator=mtp` drafts with the checkpoint's head (state per slot; `mtp_depth`, default 7, is the most draft
   tokens per round). The DFlash2 drafter (`draft_model_dir` = `Qwen3.8-Flash-Next-DFlash2`, `configs/flash_next_dflash2.json`) drafts a block per round

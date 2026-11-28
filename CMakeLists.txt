@@ -586,6 +586,7 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 		src/kernels/cuda/trellis/quant/exl3_encode_lo.cu
 		src/kernels/cuda/trellis/quant/exl3_encode_hi.cu
 		src/kernels/cuda/trellis/quant/exl3_quantize.cu
+		src/kernels/cuda/nvfp4/quant/nvfp4_quantize.cu
 	)
 	# cuSOLVER for the Hessian factorization and the scale refit's linear systems (the quantizer only)
 	target_link_libraries(engine_quant PUBLIC engine_kernels CUDA::cusolver)
@@ -638,6 +639,12 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	target_link_libraries(test_exl3_quantize PRIVATE engine_quant)
 	set_target_properties(test_exl3_quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
+	# The NVFP4 quantizer on a synthetic weight and Hessian: round to nearest against a host restatement, the proxy errors of the decoded tensors,
+	# the error feedback against none
+	add_executable(test_nvfp4_ldlq tests/2_parity/test_nvfp4_ldlq.cpp)
+	target_link_libraries(test_nvfp4_ldlq PRIVATE engine_quant)
+	set_target_properties(test_nvfp4_ldlq PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
 	# The quantization tools' common parts: safetensors files, the template plan, the original's weights, expert down Hessians
 	add_library(engine_quant_tools STATIC
 		src/tools/quant/st_io.cpp
@@ -654,6 +661,11 @@ if(ENGINE_BACKEND STREQUAL "CUDA")
 	add_executable(volta_quantize src/tools/volta_quantize.cpp)
 	target_link_libraries(volta_quantize PRIVATE engine_quant_tools)
 	set_target_properties(volta_quantize PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+
+	# Calibrated NVFP4 dense projections of a modelopt checkpoint (block LDLQ with engine Hessian captures) for nvfp4_dense_dir
+	add_executable(volta_nvfp4 src/tools/volta_nvfp4.cpp)
+	target_link_libraries(volta_nvfp4 PRIVATE engine_quant_tools)
+	set_target_properties(volta_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Anthropic request bodies from recorded Claude Code sessions (rendered by the server's count_tokens with dump_requests: calibration prompts)
 	add_executable(volta_sessions src/tools/volta_sessions.cpp)

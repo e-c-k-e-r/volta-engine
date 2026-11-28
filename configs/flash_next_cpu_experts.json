@@ -11,6 +11,7 @@
 		"max_seq": 32768,
 		"nvfp4_experts": "/path/to/Qwen3.8-Flash-Next-NVFP4",
 		"nvfp4_dense": "all",
+		"nvfp4_dense_dir": "/path/to/Qwen3.8-Flash-Next-NVFP4-dense",
 		"expert_cache": 0.4,
 		"expert_adapt_every": 0,
 		"cpu_experts": 1.0
