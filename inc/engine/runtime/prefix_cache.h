@@ -77,6 +77,17 @@ public:
 	Entry* insert( Entry* parent, std::vector<int> tokens, ModelCluster::SeqSnapshot snap, bool pinned );
 	void clear();
 	Stats stats() const;
+
+	// Contexts (libvolta): a node's chain, root first, as bytes the host keeps: the ranks, the node count, the whole prefix's tokens, then per
+	// node its from, tokens, flags (tap rows, stripped), the bytes per rank of its content and each rank's content
+	void export_chain( const Entry* e, std::vector<uint8_t>* out ) const;
+	// export_chain's bytes back: the nodes the cache holds already are kept (a stripped one takes the state back), the others inserted, the
+	// last pinned when asked (a present one too). The deepest node, or nullptr with *err set (malformed bytes, another layout, no room;
+	// the nodes inserted before stay, as cached prefixes)
+	Entry* import_chain( const uint8_t* data, size_t size, bool pinned, std::string* err );
+	void set_pinned( Entry* e, bool pinned ) { e->pinned = pinned; }
+	// Frees e now; false (nothing freed) when other nodes hang from it
+	bool drop( Entry* e );
 	size_t budget() const { return budget_; }
 
 private:

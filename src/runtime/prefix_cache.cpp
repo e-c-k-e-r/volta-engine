@@ -458,6 +458,113 @@ void PrefixCache::clear() {
 	entries_.clear();
 }
 
+namespace {
+
+template <typename T>
+void put( std::vector<uint8_t>* out, const T& v ) {
+	const uint8_t* p = reinterpret_cast<const uint8_t*>( &v );
+	out->insert( out->end(), p, p + sizeof( T ) );
+}
+
+template <typename T>
+bool take( const uint8_t*& p, const uint8_t* end, T* v ) {
+	if ( static_cast<size_t>( end - p ) < sizeof( T ) ) return false;
+	std::memcpy( v, p, sizeof( T ) );
+	p += sizeof( T );
+	return true;
+}
+
+}   // namespace
+
+void PrefixCache::export_chain( const Entry* e, std::vector<uint8_t>* out ) const {
+	std::vector<const Entry*> chain;
+	for ( const Entry* n = e; n; n = n->parent ) chain.push_back( n );
+	std::reverse( chain.begin(), chain.end() );
+	const int tp = cluster_.tp();
+	put( out, static_cast<int32_t>( tp ) );
+	put( out, static_cast<int32_t>( chain.size() ) );
+	put( out, static_cast<int32_t>( e->tokens.size() ) );
+	for ( int t : e->tokens ) put( out, static_cast<int32_t>( t ) );
+	for ( const Entry* n : chain ) {
+		const ModelCluster::SeqSnapshot& s = n->snap;
+		const size_t bytes = cluster_.snapshot_payload( s.from, s.tokens, s.with_taps, s.rows_only );
+		put( out, static_cast<int32_t>( s.from ) );
+		put( out, static_cast<int32_t>( s.tokens ) );
+		put( out, static_cast<int32_t>( ( s.with_taps ? kFlagTaps : 0 ) | ( s.rows_only ? kFlagRowsOnly : 0 ) ) );
+		put( out, static_cast<int64_t>( bytes ) );
+		for ( int r = 0; r < tp; ++r ) {
+			const uint8_t* p = static_cast<const uint8_t*>( s.host[r] );
+			out->insert( out->end(), p, p + bytes );
+		}
+	}
+}
+
+PrefixCache::Entry* PrefixCache::import_chain( const uint8_t* data, size_t size, bool pinned, std::string* err ) {
+	const uint8_t* p = data;
+	const uint8_t* end = data + size;
+	int32_t tp = 0, nodes = 0, total = 0;
+	if ( !take( p, end, &tp ) || !take( p, end, &nodes ) || !take( p, end, &total ) || tp != cluster_.tp() || nodes < 1 || total < 1 ||
+		total > cluster_.metadata().max_seq_len || static_cast<size_t>( end - p ) < static_cast<size_t>( total ) * sizeof( int32_t ) ) {
+		*err = "the context is malformed or made for another number of ranks";
+		return nullptr;
+	}
+	std::vector<int> tokens( total );
+	for ( int i = 0; i < total; ++i ) take( p, end, &tokens[i] );
+	constexpr size_t kRound = size_t( 8 ) << 20;   // the buffer classes of ModelCluster::save_snapshot
+	Entry* parent = nullptr;
+	int at = 0;
+	for ( int k = 0; k < nodes; ++k ) {
+		int32_t from = 0, upto = 0, flags = 0;
+		int64_t bytes = 0;
+		if ( !take( p, end, &from ) || !take( p, end, &upto ) || !take( p, end, &flags ) || !take( p, end, &bytes ) || from != at || upto <= from ||
+			upto > total || ( k + 1 == nodes ) != ( upto == total ) || bytes <= 0 || static_cast<uint64_t>( end - p ) < static_cast<uint64_t>( bytes ) * tp ) {
+			*err = "the context is malformed";
+			return nullptr;
+		}
+		const bool taps = ( flags & kFlagTaps ) != 0, rows_only = ( flags & kFlagRowsOnly ) != 0;
+		if ( static_cast<size_t>( bytes ) != cluster_.snapshot_payload( from, upto, taps, rows_only ) ) {
+			*err = "the context's snapshots are not this model's layout";
+			return nullptr;
+		}
+		std::vector<int> prefix( tokens.begin(), tokens.begin() + upto );
+		Entry* same = exact( prefix );
+		if ( same && ( rows_only || !same->snap.rows_only ) ) {
+			p += static_cast<size_t>( bytes ) * tp;   // the cache holds this node already
+		}
+		else {
+			ModelCluster::SeqSnapshot snap;
+			if ( !cluster_.alloc_snapshot( from, upto, taps, ( static_cast<size_t>( bytes ) + kRound - 1 ) / kRound * kRound, &snap ) ) {
+				*err = "no pinned host memory for the context";
+				return nullptr;
+			}
+			snap.rows_only = rows_only;
+			for ( int r = 0; r < tp; ++r, p += bytes ) std::memcpy( snap.host[r], p, static_cast<size_t>( bytes ) );
+			Entry* e = same ? ( refill( same, snap ) ? same : nullptr ) : insert( parent, std::move( prefix ), snap, false );
+			if ( !e ) {
+				*err = "the context does not fit the prefix cache's budget (prefix_cache_gib)";
+				return nullptr;
+			}
+			same = e;
+		}
+		parent = same;
+		at = upto;
+	}
+	if ( pinned ) parent->pinned = true;
+	touch_chain( parent );
+	return parent;
+}
+
+bool PrefixCache::drop( Entry* e ) {
+	if ( e->children > 0 ) return false;
+	for ( size_t k = 0; k < entries_.size(); ++k ) {
+		if ( entries_[k].get() == e ) {
+			remove( k );
+			return true;
+		}
+	}
+	return false;
+}
+
 PrefixCache::Stats PrefixCache::stats() const {
 	Stats s = stats_;
 	s.entries = entries_.size();

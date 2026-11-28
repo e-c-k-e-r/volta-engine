@@ -10,6 +10,8 @@
 #include <cstring>
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+#include <future>
 
 namespace engine::runtime {
 
@@ -74,7 +76,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 			std::vector<std::string> files;
 			for ( const auto& de : std::filesystem::directory_iterator( config.model_dir, ec ) ) {
 				const std::string ext = de.path().extension().string();
-				if ( ext == ".safetensors" || ext == ".json" ) files.push_back( de.path().filename().string() + " " + std::to_string( de.file_size( ec ) ) + " " +
+				if ( ext == ".safetensors" || ext == ".gguf" || ext == ".json" ) files.push_back( de.path().filename().string() + " " + std::to_string( de.file_size( ec ) ) + " " +
 					std::to_string( std::filesystem::last_write_time( de.path(), ec ).time_since_epoch().count() ) );
 			}
 			std::sort( files.begin(), files.end() );
@@ -91,6 +93,7 @@ bool Generator::init( const engine::server::ServerConfig& config ) {
 
 	running_.store( true );
 	scheduler_thread_ = std::thread( &Generator::scheduler_loop, this );
+	scheduler_id_ = scheduler_thread_.get_id();
 	if ( runtime::options().pin_threads ) {
 		cpu_set_t cpuset;
 		CPU_ZERO( &cpuset );
@@ -106,6 +109,7 @@ void Generator::shutdown() {
 	if ( scheduler_thread_.joinable() ) {
 		scheduler_thread_.join();
 	}
+	run_tasks();   // what was queued before the scheduler stopped (nothing is queued once running_ is false)
 	prefix_cache_.reset();
 	cluster_.shutdown();
 	if ( was_running ) {
@@ -177,8 +181,38 @@ void Generator::admit_pending() {
 	}
 }
 
+void Generator::run_tasks() {
+	std::deque<std::function<void()>> run;
+	{
+		std::lock_guard<std::mutex> lock( queue_mtx_ );
+		run.swap( tasks_ );
+	}
+	for ( auto& t : run ) t();
+}
+
+bool Generator::run_on_scheduler( std::function<void()> fn ) {
+	if ( std::this_thread::get_id() == scheduler_id_ ) {
+		fn();
+		return true;
+	}
+	auto done = std::make_shared<std::promise<void>>();
+	std::future<void> ready = done->get_future();
+	{
+		std::lock_guard<std::mutex> lock( queue_mtx_ );
+		if ( !running_.load() ) return false;
+		tasks_.push_back( [fn = std::move( fn ), done]() {
+			fn();
+			done->set_value();
+		} );
+	}
+	queue_cv_.notify_one();
+	ready.wait();
+	return true;
+}
+
 void Generator::scheduler_loop() {
 	while ( running_.load() ) {
+		run_tasks();
 		admit_pending();
 		bool any_active = false;
 		for ( int s = 0; s < num_slots_; ++s ) {
@@ -190,7 +224,7 @@ void Generator::scheduler_loop() {
 			if ( settle ) fold_expert_heat( true );   // the last second of a short request would otherwise wait for the next one
 			std::unique_lock<std::mutex> lock( queue_mtx_ );
 			queue_cv_.wait_for( lock, std::chrono::milliseconds( 2 ), [&]() {
-				return !pending_queue_.empty() || !running_.load();
+				return !pending_queue_.empty() || !tasks_.empty() || !running_.load();
 			} );
 			continue;
 		}
@@ -1376,6 +1410,133 @@ MonitorSnapshot Generator::get_monitor() const {
 		m.gap_hist[b] += 1.0f;
 	}
 	return m;
+}
+
+// ---- contexts (libvolta) ----------------------------------------------------------------------------------------------------------------
+
+namespace {
+
+constexpr char kContextMagic[4] = { 'V', 'C', 'T', 'X' };
+constexpr int32_t kContextVersion = 1;
+
+uint64_t fnv1a( const char* p, size_t n, uint64_t h = 1469598103934665603ULL ) {
+	for ( size_t i = 0; i < n; ++i ) h = ( h ^ static_cast<uint8_t>( p[i] ) ) * 1099511628211ULL;
+	return h;
+}
+
+}   // namespace
+
+// What a context's snapshots depend on, without the paths or file times of the disk tier's fingerprint (a context may move to another machine
+// with the same files): the model directory's weight and config files by name and size, a hash of the first MiB of each weight file, the
+// options that change the snapshot layout, the ranks and the snapshot sizes
+const std::string& Generator::context_fingerprint() {
+	if ( !context_fp_.empty() ) return context_fp_;
+	const auto& opt = runtime::options();
+	std::vector<std::filesystem::path> files;
+	std::error_code ec;
+	for ( const auto& de : std::filesystem::directory_iterator( config_.model_dir, ec ) ) {
+		const std::string ext = de.path().extension().string();
+		if ( ext == ".safetensors" || ext == ".gguf" || ext == ".json" ) files.push_back( de.path() );
+	}
+	std::sort( files.begin(), files.end() );
+	std::string fp = "volta-engine context v1\n";
+	std::vector<char> head( size_t( 1 ) << 20 );
+	for ( const auto& f : files ) {
+		std::ifstream in( f, std::ios::binary );
+		in.read( head.data(), static_cast<std::streamsize>( head.size() ) );
+		char hash[32];
+		std::snprintf( hash, sizeof( hash ), "%016llx", static_cast<unsigned long long>( fnv1a( head.data(), static_cast<size_t>( in.gcount() ) ) ) );
+		fp += f.filename().string() + " " + std::to_string( std::filesystem::file_size( f, ec ) ) + " " + hash + "\n";
+	}
+	fp += "kv_format " + opt.kv_format + ( opt.kv_shard ? "\nkv_shard" : "" ) + "\nnvfp4_experts " + std::filesystem::path( opt.nvfp4_experts ).filename().string() +
+		"\nnvfp4_dense " + opt.nvfp4_dense + "\nranks " + std::to_string( cluster_.tp() ) + "\nalign " + std::to_string( cluster_.snapshot_align() ) + "\nbytes " +
+		std::to_string( cluster_.snapshot_bytes( 0, cluster_.snapshot_align() ) ) + " " + std::to_string( cluster_.snapshot_bytes( 0, cluster_.snapshot_align(), true ) ) + "\n";
+	context_fp_ = fp;
+	return context_fp_;
+}
+
+bool Generator::export_context( const std::vector<int>& prompt, const std::vector<GenerationRequest::Image>& images, std::vector<int>* tokens,
+	std::vector<uint8_t>* data, std::string* err ) {
+	if ( !prefix_cache_ ) {
+		*err = "the prefix cache is off (prefix_cache_gib 0, or a model that cannot snapshot)";
+		return false;
+	}
+	std::vector<int> key = prompt;
+	for ( const GenerationRequest::Image& im : images ) {
+		for ( int i = 0; i < im.count && im.start + i < static_cast<int>( key.size() ); ++i ) key[im.start + i] = mm_key_token( im.hash, i, cluster_.metadata().vocab_size );
+	}
+	bool found = false;
+	const bool ran = run_on_scheduler( [&]() {
+		const PrefixCache::Entry* e = prefix_cache_->find( key );
+		if ( !e ) return;
+		found = true;
+		*tokens = e->tokens;
+		const std::string& fp = context_fingerprint();
+		data->clear();
+		data->insert( data->end(), kContextMagic, kContextMagic + 4 );
+		const int32_t head[2] = { kContextVersion, static_cast<int32_t>( fp.size() ) };
+		data->insert( data->end(), reinterpret_cast<const uint8_t*>( head ), reinterpret_cast<const uint8_t*>( head ) + sizeof( head ) );
+		data->insert( data->end(), fp.begin(), fp.end() );
+		prefix_cache_->export_chain( e, data );
+	} );
+	if ( !ran ) *err = "the engine is not running";
+	else if ( !found ) *err = "nothing of this prompt is cached (prompts of at least " + std::to_string( kPrefixMinTokens ) + " tokens are)";
+	return ran && found;
+}
+
+bool Generator::import_context( const std::vector<uint8_t>& data, bool pinned, std::vector<int>* tokens, std::string* err ) {
+	if ( !prefix_cache_ ) {
+		*err = "the prefix cache is off (prefix_cache_gib 0, or a model that cannot snapshot)";
+		return false;
+	}
+	int32_t head[2] = {};
+	if ( data.size() < 4 + sizeof( head ) || std::memcmp( data.data(), kContextMagic, 4 ) != 0 ) {
+		*err = "not a context";
+		return false;
+	}
+	std::memcpy( head, data.data() + 4, sizeof( head ) );
+	const size_t body = 4 + sizeof( head ) + static_cast<size_t>( head[1] );
+	if ( head[0] != kContextVersion || head[1] < 0 || body > data.size() ) {
+		*err = "a context of another version, or malformed";
+		return false;
+	}
+	bool ok = false;
+	const bool ran = run_on_scheduler( [&]() {
+		const std::string& fp = context_fingerprint();
+		if ( static_cast<size_t>( head[1] ) != fp.size() || std::memcmp( data.data() + 4 + sizeof( head ), fp.data(), fp.size() ) != 0 ) {
+			*err = "the context was made by another model, KV format or device layout";
+			return;
+		}
+		if ( PrefixCache::Entry* e = prefix_cache_->import_chain( data.data() + body, data.size() - body, pinned, err ) ) {
+			*tokens = e->tokens;
+			ok = true;
+		}
+	} );
+	if ( !ran ) *err = "the engine is not running";
+	return ran && ok;
+}
+
+bool Generator::release_context( const std::vector<int>& tokens, bool drop, std::string* err ) {
+	if ( !prefix_cache_ ) {
+		*err = "the prefix cache is off";
+		return false;
+	}
+	bool ok = false;
+	const bool ran = run_on_scheduler( [&]() {
+		PrefixCache::Entry* e = prefix_cache_->exact( tokens );
+		if ( !e ) {
+			*err = "no cached prefix of exactly these tokens";
+			return;
+		}
+		prefix_cache_->set_pinned( e, false );
+		if ( drop && !prefix_cache_->drop( e ) ) {
+			*err = "unpinned, but longer cached prefixes hang from it, so it stays";
+			return;
+		}
+		ok = true;
+	} );
+	if ( !ran ) *err = "the engine is not running";
+	return ran && ok;
 }
 
 } // namespace engine::runtime

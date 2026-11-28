@@ -245,6 +245,23 @@ public:
 	bool check_steer( const std::string& vector, const std::string& scope, std::string* err );
 	bool check_probes( const std::vector<std::string>& names, std::string* err );   // the request's probes (or the probe option's) exist and are probe files
 
+	// Runs fn on the scheduler thread between steps and returns once it has run (the prefix cache is that thread's); called on the scheduler
+	// thread itself, runs it at once. False when the generator is not running
+	bool run_on_scheduler( std::function<void()> fn );
+	bool prefix_cache_on() const { return prefix_cache_ != nullptr; }
+	bool on_scheduler_thread() const { return std::this_thread::get_id() == scheduler_id_; }
+	static constexpr int kPrefixMinTokens = 512;   // shorter prompts are not cached
+	// Contexts (libvolta): the prefix cache's snapshots of a prompt's first tokens as bytes a host keeps, and back. Each carries a fingerprint
+	// of the model files, the options the snapshot layout depends on and the ranks, and loads only into a generator with the same.
+	// export_context: the deepest cached resume point of the prompt (its images keyed by content, as the cache keys them); tokens receives
+	// the prefix it covers (image runs as their content keys). import_context: into the cache, the deepest node pinned when asked (never
+	// evicted until released); tokens receives its prefix. release_context: unpins the node of exactly `tokens`, and with drop frees it when
+	// no node hangs from it. False with *err set
+	bool export_context( const std::vector<int>& prompt, const std::vector<GenerationRequest::Image>& images, std::vector<int>* tokens,
+		std::vector<uint8_t>* data, std::string* err );
+	bool import_context( const std::vector<uint8_t>& data, bool pinned, std::vector<int>* tokens, std::string* err );
+	bool release_context( const std::vector<int>& tokens, bool drop, std::string* err );
+
 private:
 	struct Slot {
 		bool active = false;
@@ -290,6 +307,11 @@ private:
 	};
 
 	void scheduler_loop();
+	void run_tasks();   // run_on_scheduler's queue (scheduler thread)
+	std::deque<std::function<void()>> tasks_;   // guarded by queue_mtx_
+	std::thread::id scheduler_id_;
+	const std::string& context_fingerprint();   // built on first use (it reads the start of every weight file)
+	std::string context_fp_;
 	void admit_pending();
 	void step_batch();
 	// Offers the slot's next speculation round the tokens that followed the last earlier occurrence of its current suffix (spec_suffix)
@@ -302,7 +324,6 @@ private:
 	int pf_cooldown_left_ = 0;   // prefill_cooldown: the steps still to run without a prompt piece
 	int pf_rr_ = 0;   // the slot after which the next prefilling slot is looked for
 	PrefixCache::Entry* store_prefix( int s, int tokens, bool pinned, bool with_taps );
-	static constexpr int kPrefixMinTokens = 512;
 	// Commits `tok` to slot s's output; returns true when the request finished.
 	static int loop_detect_mode();
 	bool emit_token( int s, int tok, const Candidates* row = nullptr );   // row: the token's unpenalized candidates, for log-probabilities

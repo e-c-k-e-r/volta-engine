@@ -758,6 +758,18 @@ size_t ModelCluster::snapshot_bytes( int from, int tokens, bool with_taps ) cons
 	return models_[0]->seq_state_bytes( from, tokens, with_taps );
 }
 
+size_t ModelCluster::snapshot_payload( int from, int tokens, bool with_taps, bool rows_only ) const {
+	if ( !rows_only ) return snapshot_bytes( from, tokens, with_taps );
+	// rows_snapshot's copy: each rank's KV rows (the span after the tap rows), into buffers as large as the largest
+	size_t need = 0;
+	for ( int d = 0; d < tp_; ++d ) {
+		size_t offset = 0, rows = 0;
+		if ( !models_[d]->seq_rows_span( from, tokens, with_taps, &offset, &rows ) ) return 0;
+		need = std::max( need, rows );
+	}
+	return need;
+}
+
 bool ModelCluster::alloc_snapshot( int from, int tokens, bool with_taps, size_t bytes, SeqSnapshot* snap ) {
 	snap->from = from;
 	snap->with_taps = with_taps;

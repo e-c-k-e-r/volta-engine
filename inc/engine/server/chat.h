@@ -140,6 +140,11 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, uint64_t request_id, int* tokens,
 	ApiError* err );
 
+// The prompt tokens and media runs a request renders to, as start_chat submits them (a text completion's tokens as given), for the
+// prefix cache's contexts (Generator::export_context)
+bool render_request_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::vector<int>* tokens,
+	std::vector<engine::runtime::GenerationRequest::Image>* images, ApiError* err );
+
 // What rendering a request reads from the model: its chat template, tokenizer, vision tower (nullptr: an image becomes a note in the
 // text) and context window. The server takes them from its generator; tools without weights load the template and tokenizer alone
 struct PromptModel {

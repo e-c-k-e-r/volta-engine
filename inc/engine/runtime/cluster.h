@@ -79,6 +79,9 @@ public:
 	};
 	int snapshot_align() const { return models_[0]->seq_align(); }
 	size_t snapshot_bytes( int from, int tokens, bool with_taps = false ) const;    // per rank; 0 when the model cannot snapshot
+	// The bytes of a snapshot's buffers that hold its content, the most of any rank (the buffers are rounded up to classes): snapshot_bytes,
+	// or for a rows_only one its KV rows; 0 when the model cannot snapshot
+	size_t snapshot_payload( int from, int tokens, bool with_taps, bool rows_only ) const;
 	bool save_snapshot( int slot, int from, int tokens, SeqSnapshot* snap, bool with_taps = true );
 	// Host buffers of `bytes` per rank for a snapshot that is filled from elsewhere (the prefix cache's disk tier); false when pinning fails
 	bool alloc_snapshot( int from, int tokens, bool with_taps, size_t bytes, SeqSnapshot* snap );

@@ -670,6 +670,18 @@ bool count_chat_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg
 	return true;
 }
 
+bool render_request_tokens( engine::runtime::Generator& gen, const ServerConfig& cfg, const ChatRequest& req, std::vector<int>* tokens, ImageList* images,
+	ApiError* err ) {
+	images->clear();
+	if ( req.raw ) {
+		*tokens = req.raw_tokens.empty() ? gen.tokenizer().encode( req.raw_prompt, false ) : req.raw_tokens;
+		return true;
+	}
+	std::string prompt;
+	MediaTokens media;
+	return render_prompt( prompt_model( gen ), cfg, req, &prompt, tokens, images, &media, err );
+}
+
 bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatRequest req, uint64_t request_id,
 	std::shared_ptr<Responder> responder, const ConnPtr& conn, ApiError* err ) {
 	const auto family = gen.chat_template().model_family();
@@ -797,7 +809,7 @@ bool start_chat( engine::runtime::Generator& gen, const ServerConfig& cfg, ChatR
 			g.checkpoint_at.push_back( { static_cast<int>( head.size() ), pinned } );
 		};
 		const bool ds = family == engine::loader::ModelFamily::DEEPSEEK, gemma = family == engine::loader::ModelFamily::GEMMA;
-		add( prompt.find( ds ? "<｜User｜>" : glm ? "<|user|>" : gemma ? "<|turn>user" : "<|im_start|>user" ), true, 1024 );
+		add( prompt.find( ds ? "<｜User｜>" : glm ? "<|user|>" : gemma ? "<|turn>user" : "<|im_start|>user" ), engine::runtime::options().prefix_pin_system, 1024 );
 		add( prompt.rfind( ds ? "<｜Assistant｜>" : glm ? "<|assistant|>" : gemma ? "<|turn>model" : "<|im_start|>assistant" ), false, 512 );
 	}
 	const bool raw = req.raw;

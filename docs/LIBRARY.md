@@ -54,6 +54,36 @@ auto engine = volta::Engine::create( config_json, &error );   // or ( config_jso
 - Errors come back as strings: an invalid config, a model that fails to load (the last error line logged), a bad request body. An internal
   invariant failing (`ENGINE_ASSERT`, including an arena that runs out of memory) still ends the process, as it does in volta_server.
 
+## Contexts
+
+Every chat resumes from the longest cached beginning of its prompt: the prefix cache keeps KV snapshots of prompts of at least 512 tokens in
+pinned host memory (`prefix_cache_gib`) and, with `prefix_cache_dir`, evicted ones on disk across restarts ([SERVER.md](SERVER.md)). A host can
+also warm that cache and keep its content itself, e.g. a character's long backstory in a save file:
+
+```cpp
+engine->prefill( body, &error );                     // the prompt into the cache, no reply (one token sampled and dropped)
+volta::Context ctx;
+engine->export_context( body, &ctx, &error );        // the cached beginning of the prompt the body renders: ctx.tokens, ctx.data
+...
+engine->import_context( ctx, /*pinned*/ true, &error );   // back into the cache (another run, another process)
+engine->chat( body, on_event, &error );               // resumes after ctx.tokens
+engine->release_context( ctx.tokens, /*drop*/ false, &error );   // evictable again (drop: freed now)
+```
+
+- A context is the cache's chain of snapshots for that prefix (a shared root, such as a world's lore, is a node of its own, and importing a
+  context whose root the cache holds already reuses it), with a fingerprint of the model files (names, sizes and a hash of each file's first
+  MiB), the options the snapshot layout depends on (`kv_format`, ...) and the device layout. It loads only into an engine with the same;
+  `import_context` refuses others.
+- Its size is the prompt's KV: for Gemma 4 E4B 16 KiB a token in FP16 (8 in FP8, about 4 in NVFP4, `kv_format`) on its four full-attention
+  layers, plus 20 MiB for the sliding-window layers' last 512 positions (FP16): a 1561-token prompt is 45 MiB, imported in 32 ms (`test_library`).
+- `export_context` fails when nothing of the prompt is cached, `prefill` for prompts under 512 tokens. A pinned context counts against
+  `prefix_cache_gib` until it is released.
+- Only a prompt's exact beginning is reused: whatever comes after the first token that differs (a memory list in another order, a changed
+  line) is prefilled again, so a prompt that keeps its unchanging parts first gets the most from the cache.
+- A system block of at least 1024 tokens is pinned when it is first prefilled, for every later conversation that shares it
+  (`prefix_pin_system`); a host with many distinct system prompts (one per character) can set it false so they age out like any prefix.
+- These calls are not for an `on_event` callback: `prefill` waits for the scheduler thread that runs the callbacks, and the others run on it.
+
 ## The Vulkan device
 
 `volta::VulkanDevice` chooses the device of a Vulkan build:
@@ -77,6 +107,7 @@ The arena is sized from the memory the device reports free (`VK_EXT_memory_budge
 
 `test_library <launch config> [--adopt | --adopt-bad] [--out <dir>]` links `libvolta.so` and includes `volta/volta.h` alone: log lines reach
 the callback, a second Engine is refused, a streamed chat, a tool call, cancelling from the callback and with `cancel`, `count_tokens` (also
-with a video of the host's frames and with a clip of its samples, and a video part without one refused), a bad body; with speech, a line spoken to `library_speech.wav`, that speech added as a voice and a second line spoken in it, `speak_async`, and a
+with a video of the host's frames and with a clip of its samples, and a video part without one refused), a bad body, contexts (a long character prompt prefilled, a chat resuming from it, `export_context`, and a second process that refuses a tampered
+copy, imports the context and gets the same reply from it); with speech, a line spoken to `library_speech.wav`, that speech added as a voice and a second line spoken in it, `speak_async`, and a
 bad speech body. `--adopt` creates the test's own Vulkan instance and device first, as a game would, and runs the same checks on it;
 `--adopt-bad` creates it without `shaderInt64` and expects `create` to refuse it by name.

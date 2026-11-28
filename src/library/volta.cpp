@@ -406,6 +406,124 @@ int Engine::count_tokens( const std::string& request_json, const Media& media, s
 	return tokens;
 }
 
+namespace {
+
+// prefill's reply: nothing forwarded, the finish signalled
+class PrefillResponder : public engine::server::Responder {
+public:
+	bool on_event( const engine::server::OutputEvent& ) override { return true; }
+	void on_finish( engine::runtime::FinishReason reason, const std::string&, bool, const engine::server::Usage& usage ) override {
+		std::lock_guard<std::mutex> lock( mu );
+		cancelled = reason == engine::runtime::FinishReason::Cancelled;
+		prompt_tokens = usage.prompt_tokens;
+		done = true;
+		cv.notify_all();
+	}
+	std::mutex mu;
+	std::condition_variable cv;
+	bool done = false, cancelled = false;
+	int prompt_tokens = 0;
+};
+
+}   // namespace
+
+int Engine::prefill( const std::string& request_json, std::string* error ) { return prefill( request_json, Media(), error ); }
+
+int Engine::prefill( const std::string& request_json, const Media& media, std::string* error ) {
+	Impl& P = *p_;
+	if ( !P.gen ) {
+		*error = "no text model (the config has no model_dir)";
+		return -1;
+	}
+	if ( !P.gen->prefix_cache_on() ) {
+		*error = "the prefix cache is off (prefix_cache_gib 0, or a model that cannot snapshot)";
+		return -1;
+	}
+	if ( P.gen->on_scheduler_thread() ) {
+		*error = "prefill waits for the scheduler thread: not from an on_event callback";
+		return -1;
+	}
+	engine::server::ChatRequest req;
+	engine::server::ApiError err;
+	if ( !P.openai->parse( request_json, &req, &err ) ) {
+		*error = err.message;
+		return -1;
+	}
+	if ( !attach_media( &req, media, error ) ) return -1;
+	std::vector<int> tokens;
+	std::vector<engine::runtime::GenerationRequest::Image> images;
+	if ( !engine::server::render_request_tokens( *P.gen, P.cfg, req, &tokens, &images, &err ) ) {
+		*error = err.message;
+		return -1;
+	}
+	if ( static_cast<int>( tokens.size() ) < engine::runtime::Generator::kPrefixMinTokens ) {
+		*error = "prompts under " + std::to_string( engine::runtime::Generator::kPrefixMinTokens ) + " tokens are not cached";
+		return -1;
+	}
+	req.max_tokens = 1;
+	req.stream = false;
+	auto responder = std::make_shared<PrefillResponder>();
+	if ( !engine::server::start_chat( *P.gen, P.cfg, std::move( req ), ++P.next_id, responder, nullptr, &err ) ) {
+		*error = err.message;
+		return -1;
+	}
+	std::unique_lock<std::mutex> lock( responder->mu );
+	responder->cv.wait( lock, [&] { return responder->done; } );
+	if ( responder->cancelled ) {
+		*error = "the prefill was cancelled (the engine is shutting down)";
+		return -1;
+	}
+	return responder->prompt_tokens;
+}
+
+bool Engine::export_context( const std::string& request_json, Context* out, std::string* error ) { return export_context( request_json, Media(), out, error ); }
+
+bool Engine::export_context( const std::string& request_json, const Media& media, Context* out, std::string* error ) {
+	Impl& P = *p_;
+	if ( !P.gen ) {
+		*error = "no text model (the config has no model_dir)";
+		return false;
+	}
+	engine::server::ChatRequest req;
+	engine::server::ApiError err;
+	if ( !P.openai->parse( request_json, &req, &err ) ) {
+		*error = err.message;
+		return false;
+	}
+	if ( !attach_media( &req, media, error ) ) return false;
+	std::vector<int> tokens;
+	std::vector<engine::runtime::GenerationRequest::Image> images;
+	if ( !engine::server::render_request_tokens( *P.gen, P.cfg, req, &tokens, &images, &err ) ) {
+		*error = err.message;
+		return false;
+	}
+	return P.gen->export_context( tokens, images, &out->tokens, &out->data, error );
+}
+
+bool Engine::import_context( const Context& context, bool pinned, std::string* error ) {
+	Impl& P = *p_;
+	if ( !P.gen ) {
+		*error = "no text model (the config has no model_dir)";
+		return false;
+	}
+	std::vector<int> tokens;
+	if ( !P.gen->import_context( context.data, pinned, &tokens, error ) ) return false;
+	if ( tokens != context.tokens ) {
+		*error = "the context's tokens do not match its data (its prefix is cached as the data says)";
+		return false;
+	}
+	return true;
+}
+
+bool Engine::release_context( const std::vector<int>& tokens, bool drop, std::string* error ) {
+	Impl& P = *p_;
+	if ( !P.gen ) {
+		*error = "no text model (the config has no model_dir)";
+		return false;
+	}
+	return P.gen->release_context( tokens, drop, error );
+}
+
 bool Engine::speak( const std::string& request_json, Speech* out, std::string* error ) { return p_->speak( request_json, out, error ); }
 
 void Engine::speak_async( const std::string& request_json, std::function<void( bool ok, Speech& speech, const std::string& error )> done ) {

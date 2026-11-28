@@ -1,5 +1,6 @@
 // libvolta from a host's side: links libvolta.so and includes volta/volta.h alone. A streamed chat, a tool call, count_tokens (also with a
-// video from the host's frames), a cancelled reply; with speech, a line spoken to a WAV, that speech added as a voice and a second line in it, and speak_async. --adopt: the test makes
+// video from the host's frames), a cancelled reply, contexts (a long character prompt prefilled, a chat resuming from it, its context exported and
+// taken back by a second process with the same reply); with speech, a line spoken to a WAV, that speech added as a voice and a second line in it, and speak_async. --adopt: the test makes
 // its own Vulkan instance and device, as a game would, and hands them to the engine.
 // --adopt-bad: the host's device lacks shaderInt64, which create must refuse with an error naming it.
 //   test_library <launch config> [--adopt | --adopt-bad] [--out <dir>]
@@ -10,6 +11,7 @@
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -134,7 +136,7 @@ struct Reply {
 	std::condition_variable cv;
 	bool done = false;
 	std::string content, reasoning, tool_name, tool_args, finish;
-	int deltas = 0, completion_tokens = 0, prompt_tokens = 0;
+	int deltas = 0, completion_tokens = 0, prompt_tokens = 0, cached_tokens = 0;
 	double ttft_ms = 0.0, tok_s = 0.0;
 	std::function<bool( const volta::ChatEvent& )> handler( int stop_after = -1 ) {
 		return [this, stop_after]( const volta::ChatEvent& e ) {
@@ -155,6 +157,7 @@ struct Reply {
 					finish = e.finish_reason;
 					completion_tokens = e.completion_tokens;
 					prompt_tokens = e.prompt_tokens;
+					cached_tokens = e.cached_tokens;
 					ttft_ms = e.ttft_ms;
 					tok_s = e.decode_tok_s;
 					done = true;
@@ -169,6 +172,66 @@ struct Reply {
 		cv.wait( lock, [&] { return done; } );
 	}
 };
+
+// A character with a long backstory (well over the prefix cache's 512 tokens), asked one question
+std::string persona_body() {
+	std::string lore = "You are Maren, the blacksmith of Hollowford. Stay in character and answer briefly.\n\nYour history:\n";
+	const char* const places[] = { "the northern pass", "the river mill", "the old mine", "the chapel ruins", "the salt road", "the eastern forge" };
+	const char* const deeds[] = { "repaired the gate hinges", "forged a plough for the miller", "traded nails for wool", "mended a lantern frame",
+		"taught an apprentice to quench steel", "sharpened the guards' halberds" };
+	for ( int i = 0; i < 60; ++i ) lore += "In year " + std::to_string( 1100 + i ) + " you " + deeds[i % 6] + " near " + places[( i * 5 ) % 6] + ", and the village remembers it.\n";
+	std::string esc;
+	for ( char c : lore ) esc += c == '\n' ? std::string( "\\n" ) : std::string( 1, c );
+	return R"({"messages":[{"role":"system","content":")" + esc + R"("},{"role":"user","content":"What did you make for the miller?"}],"max_tokens":32,"temperature":0})";
+}
+
+// The second half of the contexts test, in a process of its own (the first engine holds the device until it is gone): a fresh engine takes
+// the context back, a tampered copy is refused, and the same chat resumes from it with the same reply
+int context_check( const std::string& config, const std::string& file ) {
+	std::ifstream in( file, std::ios::binary );
+	volta::Context ctx;
+	int32_t n = 0;
+	uint64_t bytes = 0, chars = 0;
+	in.read( reinterpret_cast<char*>( &n ), 4 );
+	ctx.tokens.resize( n > 0 ? n : 0 );
+	in.read( reinterpret_cast<char*>( ctx.tokens.data() ), 4 * static_cast<std::streamsize>( ctx.tokens.size() ) );
+	in.read( reinterpret_cast<char*>( &bytes ), 8 );
+	ctx.data.resize( bytes );
+	in.read( reinterpret_cast<char*>( ctx.data.data() ), static_cast<std::streamsize>( bytes ) );
+	in.read( reinterpret_cast<char*>( &chars ), 8 );
+	std::string expected( chars, '\0' );
+	in.read( expected.data(), static_cast<std::streamsize>( chars ) );
+	if ( !in || ctx.tokens.empty() ) {
+		std::printf( "FAIL: reading %s\n", file.c_str() );
+		return 1;
+	}
+	std::string error;
+	auto engine = volta::Engine::create( config, &error );
+	if ( !engine ) {
+		std::printf( "FAIL: create: %s\n", error.c_str() );
+		return 1;
+	}
+	volta::Context bad = ctx;
+	bad.data[12] ^= 0x20;   // a byte of the fingerprint
+	check( !engine->import_context( bad, false, &error ) && error.find( "another model" ) != std::string::npos, "a context of other settings is refused" );
+	const auto t0 = std::chrono::steady_clock::now();
+	const bool imported = engine->import_context( ctx, true, &error );
+	if ( !imported ) std::printf( "    import_context: %s\n", error.c_str() );
+	check( imported, "import_context" );
+	const double ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+	Reply r;
+	if ( engine->chat( persona_body(), r.handler(), &error ) ) {
+		r.wait();
+		std::printf( "    a fresh engine: %zu-token context (%zu KiB) imported in %.1f ms; %d of %d prompt tokens from it, ttft %.0f ms\n    \"%s\"\n", ctx.tokens.size(),
+			ctx.data.size() >> 10, ms, r.cached_tokens, r.prompt_tokens, r.ttft_ms, r.content.c_str() );
+		check( r.cached_tokens >= static_cast<int>( ctx.tokens.size() ), "the chat resumes from the imported context" );
+		check( r.content == expected, "the same reply as the engine that made the context" );
+	}
+	check( engine->release_context( ctx.tokens, false, &error ), "release_context" );
+	engine.reset();
+	std::printf( "context check: %s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail );
+	return g_fail ? 1 : 0;
+}
 
 } // namespace
 
@@ -187,6 +250,8 @@ int main( int argc, char** argv ) {
 	std::ifstream cf( argv[1] );
 	std::stringstream ss;
 	ss << cf.rdbuf();
+	for ( int i = 2; i + 1 < argc; ++i ) if ( !std::strcmp( argv[i], "--context-check" ) ) return context_check( ss.str(), argv[i + 1] );
+	std::string context_file;   // written by the contexts test, read back by a second process
 
 	std::atomic<int> log_lines{ 0 };
 	volta::set_log_callback( [&]( volta::LogLevel level, const std::string& line ) {
@@ -298,6 +363,38 @@ int main( int argc, char** argv ) {
 			check( na > n, "count_tokens with the host's audio" );
 		}
 		check( engine->chat( "{ not json", Reply().handler(), &error ) == 0 && !error.empty(), "a bad body is an error" );
+		{
+			// contexts: a long character prompt prefilled into the cache, a chat that resumes from it, its context exported for a second process
+			const std::string body = persona_body();
+			const auto p0 = std::chrono::steady_clock::now();
+			const int pn = engine->prefill( body, &error );
+			const double pms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - p0 ).count();
+			check( pn >= 512, ( "prefill: " + ( pn < 0 ? error : std::to_string( pn ) ) ).c_str() );
+			Reply r;
+			if ( pn >= 512 && engine->chat( body, r.handler(), &error ) ) {
+				r.wait();
+				std::printf( "    prefill of %d tokens in %.0f ms; the chat after it: %d prompt tokens from the cache, ttft %.0f ms\n", pn, pms, r.cached_tokens, r.ttft_ms );
+				check( r.cached_tokens > 0, "a chat after prefill resumes from the cache" );
+				volta::Context ctx;
+				const bool ok = engine->export_context( body, &ctx, &error );
+				check( ok && ctx.tokens.size() >= 512 && !ctx.data.empty(), ( "export_context: " + ( ok ? std::to_string( ctx.tokens.size() ) + " tokens" : error ) ).c_str() );
+				std::string short_err;
+				volta::Context none;
+				check( !engine->export_context( R"({"messages":[{"role":"user","content":"Hi"}]})", &none, &short_err ) && !short_err.empty(), "export_context of an uncached prompt is an error" );
+				if ( ok ) {
+					context_file = out_dir + "/library_context.bin";
+					std::ofstream o( context_file, std::ios::binary );
+					const int32_t n = static_cast<int32_t>( ctx.tokens.size() );
+					const uint64_t bytes = ctx.data.size(), chars = r.content.size();
+					o.write( reinterpret_cast<const char*>( &n ), 4 );
+					o.write( reinterpret_cast<const char*>( ctx.tokens.data() ), 4 * static_cast<std::streamsize>( n ) );
+					o.write( reinterpret_cast<const char*>( &bytes ), 8 );
+					o.write( reinterpret_cast<const char*>( ctx.data.data() ), static_cast<std::streamsize>( bytes ) );
+					o.write( reinterpret_cast<const char*>( &chars ), 8 );
+					o.write( r.content.data(), static_cast<std::streamsize>( chars ) );
+				}
+			}
+		}
 	}
 
 	if ( engine->has_speech() ) {
@@ -340,6 +437,11 @@ int main( int argc, char** argv ) {
 	}
 
 	engine.reset();
+	if ( !context_file.empty() ) {
+		// the second process, once this one has let the device go
+		const std::string cmd = std::string( "'" ) + argv[0] + "' '" + argv[1] + "' --context-check '" + context_file + "'";
+		check( std::system( cmd.c_str() ) == 0, "a second process imports the context" );
+	}
 	std::printf( "%s (%d failures)\n", g_fail ? "FAIL" : "PASS", g_fail );
 	return g_fail ? 1 : 0;
 }

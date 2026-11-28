@@ -92,6 +92,14 @@ struct Media {
 	std::vector<Audio> audio;
 };
 
+// A conversation's KV cache as bytes the host keeps (in a save file, with a level's data): what the prefix cache holds of a prompt's first
+// tokens (prompts of at least 512 tokens are cached). It loads only into an engine with the same model files, KV format (the kv_format option)
+// and device layout, of which the bytes carry a fingerprint
+struct Context {
+	std::vector<int> tokens;      // the prompt tokens it covers (image and audio runs as content keys)
+	std::vector<uint8_t> data;
+};
+
 // Mono float PCM in [-1, 1]
 struct Speech {
 	std::vector<float> pcm;
@@ -124,6 +132,22 @@ public:
 	// The prompt length a chat body renders to, or -1 with *error set
 	int count_tokens( const std::string& request_json, std::string* error );
 	int count_tokens( const std::string& request_json, const Media& media, std::string* error );
+
+	// Contexts. Every chat already resumes from the longest cached beginning of its prompt (the prefix cache: host memory, prefix_cache_gib,
+	// and with prefix_cache_dir a disk tier); these warm that cache and hand its content to the host and back. Not from an on_event callback
+	// (prefill waits for the scheduler thread that calls them; the others run there at once).
+	// Prefills the prompt a chat body renders into the cache without a reply (one token is sampled and dropped), so a later chat whose prompt
+	// begins the same way starts after it; the prompt's length, or -1 with *error set. Blocks the calling thread
+	int prefill( const std::string& request_json, std::string* error );
+	int prefill( const std::string& request_json, const Media& media, std::string* error );
+	// The cached beginning of the prompt a body renders, as a Context; false with *error set when none of it is cached
+	bool export_context( const std::string& request_json, Context* out, std::string* error );
+	bool export_context( const std::string& request_json, const Media& media, Context* out, std::string* error );
+	// A Context into the cache: the next chat whose prompt begins with its tokens resumes from it. pinned: never evicted until release_context
+	// (it counts against prefix_cache_gib meanwhile). False with *error set: made by another model or settings, malformed, or no room
+	bool import_context( const Context& context, bool pinned, std::string* error );
+	// Unpins the cached prefix of exactly these tokens; drop: frees it now as well (unless longer cached prefixes hang from it)
+	bool release_context( const std::vector<int>& tokens, bool drop, std::string* error );
 
 	// Speech: an OpenAI /v1/audio/speech body (input, voice, speed) with vall-e's fields (language, seed, cfg, cfg_prompt, steps, duration,
 	// temperature, ...; docs/TTS.md). Blocks the calling thread; one synthesis runs at a time
