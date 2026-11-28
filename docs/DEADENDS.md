@@ -77,6 +77,14 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
 * **Rotating Flash-Next's shared expert over the ranks in prefill:** rank imbalance halved, prefill +0.4% (within noise). A layer's
   all-reduce waits for the slowest rank of that layer.
 * **Overlapping rank 0's shared expert with the routed experts in prefill:** +0.2%. Rank 0's shared-expert work does not limit a chunk.
+* **Flash-Next routed experts placed by route counts** (each layer's experts dealt to the ranks heaviest first from calibration texts, the
+  router's columns permuted to match): on held-out code and agent transcripts the most-loaded rank's expert work per 512-row chunk fell from
+  1.15-1.19x to 1.12-1.14x the mean, and an 8192-token prefill of an agent transcript from 3325 to 3305 ms (-0.6%). Most of the imbalance
+  changes from chunk to chunk, which no fixed placement follows.
+* **Flash-Next routed experts sliced over the ranks** (every rank 160 of each NVFP4 expert's 640 intermediate columns, as GLM's sharded
+  layout): the ranks no longer wait for each other at the MoE, but the agent-transcript prefill went from 3326 to 3518 ms (+5.8%), M=1
+  decode stayed level (10.41 vs 10.45 ms) and the 8-row verify got 2.3% slower. Each rank then runs every active expert with a quarter of the
+  work per weight pass.
 * **FP16 residual window for layered prefill:** `hc_collapse_norm` is bound by re-reading its mixing matrix, not by the stream bytes; FP16
   streams would save memory only. Row-blocking the mix was the lever (`hc_rows`).
 * **Multi-accumulator `kda_recurrent_rows`:** a latency-bound sequential chain; reordering would break bit-identity with the fused, journal,

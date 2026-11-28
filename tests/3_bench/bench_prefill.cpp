@@ -1,7 +1,11 @@
 // Prefill throughput: tokens/s for a synthetic prompt at several chunk sizes. BENCH_PROFILE=1 brackets the final run
 // with cudaProfilerStart/Stop for nvprof --profile-from-start off. BENCH_GLM=1 / BENCH_FLASH=1 pick GLM / Flash-Next (default Qwen); BENCH_TP sets the rank count.
+// BENCH_TEXT=file: the prompt is the file's first tokens instead of random ids (a MoE model's routes then follow real text).
 //   bench_prefill [tokens] [chunk ...]
 #include "engine/runtime/test_driver.h"
+#include "engine/loader/tokenizer.h"
+#include <fstream>
+#include <iterator>
 #include <cuda_profiler_api.h>
 #include <cstdlib>
 
@@ -25,6 +29,14 @@ int main( int argc, char** argv ) {
 	std::vector<int> ids( n );
 	uint32_t st = 12345u;
 	for ( auto& t : ids ) { st = st * 1664525u + 1013904223u; t = 1000 + static_cast<int>( ( st >> 16 ) % 100000 ); }
+	if ( const char* text = std::getenv( "BENCH_TEXT" ) ) {
+		engine::loader::Tokenizer tok;
+		ENGINE_ASSERT( tok.load( cfg.model_dir.c_str() ), "bench_prefill: tokenizer" );
+		std::ifstream f( text, std::ios::binary );
+		const std::vector<int> t = tok.encode( std::string( std::istreambuf_iterator<char>( f ), std::istreambuf_iterator<char>() ), false );
+		ENGINE_ASSERT( static_cast<int>( t.size() ) >= n, "bench_prefill: BENCH_TEXT holds fewer tokens than asked for" );
+		std::copy_n( t.begin(), n, ids.begin() );
+	}
 	const bool prof = std::getenv( "BENCH_PROFILE" ) != nullptr;
 	for ( size_t ci = 0; ci < chunks.size(); ++ci ) {
 		for ( int rep = 0; rep < 2; ++rep ) {
