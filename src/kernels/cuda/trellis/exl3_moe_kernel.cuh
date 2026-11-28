@@ -281,7 +281,10 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS, const MoeExtTables ext_tables ) {
 	const int warp_idx0 = block_idx * warps_per_block + warp_id;
 
 	// Each group accumulates into its own output plane; the planes are summed in group order afterwards, so the result
-	// does not depend on which group finishes first.
+	// does not depend on which group finishes first. out_plane_stride 0 (route-out mode, prefill chunks): output_state holds a row per local
+	// route in dispatch order, the down projection's output as it leaves the GEMM; MoE::forward's combine kernel rotates, scales and sums a
+	// token's routes in route order afterwards (the per-route output pass and its two group barriers are skipped)
+	const bool route_out = out_plane_stride == 0;
 	output_state += group_idx * out_plane_stride;
 	temp_state_g += group_idx * max_tokens_per_expert * hidden_dim;
 	temp_state_u += group_idx * max_tokens_per_expert * hidden_dim;
@@ -345,11 +348,14 @@ void exl3_moe_kernel( EXL3_MOE_KERNEL_ARGS, const MoeExtTables ext_tables ) {
 				warp_idx0, warps_per_group, group_idx, group_size, barrier_counters_sense
 			);
 
-			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( bits_tab ? bits_tab[2 * num_experts + expert_idx] : K_down, temp_intermediate_g, exp_down_trellis, temp_state_g, rows, intermediate_dim, hidden_dim, locks, d_ts, d_tg );
-			group_barrier( group_idx, group_size, barrier_counters_sense );
-
-			moe_had_d_out( temp_state_g, output_state, exp_down_svh, rows, top_x, weights, hidden_dim, warp_idx0, warps_per_group );
-			group_barrier( group_idx, group_size, barrier_counters_sense );
+			// route-out: the next item's gather barrier orders this GEMM's reads of temp_intermediate_g and its locks before they are reused
+			moe_gemm_k<t_bits, MOE_TILESIZE_N, cb, wide, EXT>( bits_tab ? bits_tab[2 * num_experts + expert_idx] : K_down, temp_intermediate_g, exp_down_trellis,
+				route_out ? output_state + static_cast<size_t>( start + row0 ) * hidden_dim : temp_state_g, rows, intermediate_dim, hidden_dim, locks, d_ts, d_tg );
+			if ( !route_out ) {
+				group_barrier( group_idx, group_size, barrier_counters_sense );
+				moe_had_d_out( temp_state_g, output_state, exp_down_svh, rows, top_x, weights, hidden_dim, warp_idx0, warps_per_group );
+				group_barrier( group_idx, group_size, barrier_counters_sense );
+			}
 		}
 	};
 

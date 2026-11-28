@@ -74,9 +74,9 @@ build/volta_server --model-dir <Qwen3.8-27B-exl3> --speculative --set speculator
   window scoring every row; with `--seq` rows shorter than a window, one window holds several rows, one slot each (`max_slots` of them). It can also be the source of the MTP head (`nvfp4_dense_src=<GLM-5.3-Flash>`: layer 45 quantized to NVFP4 from FP8 at load).
 * `tp` 1, 2 or 4; on two GPUs the experts need the expert tier (`expert_cache` below 1) to fit. At `tp` 4 with every expert resident, the experts
   are sharded over the ranks (a quarter of every expert's intermediate width each); `expert_shard=0` keeps 72 whole experts per rank instead. On an
-  agent transcript (8192 tokens, 512-row chunks) whole experts prefill in 5734 ms against 6788 sharded, and decode at 18.9 ms against 15.8 at M=1 (33.96 against
-  31.0 ms for an 8-row verify): every rank of the sharded layout gathers, rotates and writes back the full hidden width of every route, four times the
-  per-route traffic of whole experts, while a decode step with whole experts waits for the rank that drew the most routes. `shared_slice` (on) cuts the
+  agent transcript (8192 tokens, 512-row chunks) whole experts prefill in 5620 ms against 5880 sharded, and decode at 18.9 ms against 15.8 at M=1 (33.96 against
+  31.0 ms for an 8-row verify): every rank of the sharded layout gathers and rotates the full hidden width of every route, four times the per-route work of
+  whole experts, while a decode step with whole experts waits for the rank that drew the most routes. `shared_slice` (on) cuts the
   shared expert and the dense MLP of layers 0-2 over the ranks.
 * Speculation: the DFlash2 drafter (`draft_model_dir`, taps of layers 5, 14, 24, 33 and 42) keeps a drafter context and tap ring per slot, so
   concurrent requests all speculate; with two slots a round drafts each slot's block in turn and verifies them in one target forward (`spec_joint`, on by

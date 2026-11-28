@@ -9,7 +9,7 @@
 #include "engine/backend/types.h"
 #include "engine/core/batch.h"
 
-#define MOE_MAX_GROUPS 8
+#define MOE_MAX_GROUPS 32   // concurrent expert groups of the persistent trellis kernel (8 unless moe_groups asks for more)
 #define MOE_MAX_EXPERTS 512   // experts per rank: 72 expert-parallel (GLM), 128 whole experts of 4 ranks (Flash-Next; 512 on a single rank)
 
 namespace pod {
@@ -45,7 +45,8 @@ struct MoEScratch {
 	engine::backend::half_t*    state_u = nullptr;
 	engine::backend::half_t*    interm_g = nullptr;       // [groups, top_k, intermediate]
 	engine::backend::half_t*    interm_u = nullptr;
-	engine::backend::half_t*    planes = nullptr;         // [MOE_MAX_GROUPS, max_rows, hidden] per-group output planes
+	engine::backend::half_t*    planes = nullptr;         // [max( groups, top_k ), max_rows, hidden]: per-group output planes, or (route-out prefill) a row per route
+	int*     route_pos = nullptr;      // [top_k * max_rows] the routes' positions in token_sorted (route-out prefill)
 	size_t   planes_bytes = 0;         // its size (the ROCm expert-grouped prefill path works in this memory)
 	// Fused decode path (exl3_moe_coop.cuh): scratch for up to 16 rows
 	engine::backend::half_t*    coop_had_g = nullptr;     // [MOE_COOP_MAX_SLOTS, hidden]
@@ -148,7 +149,8 @@ struct MoERouter {
 		int rows = 1,                   // routes = 8 * rows, token index = route / 8
 		int chunk_rows = 4,             // rows per work item (the expert GEMM tile)
 		uint32_t* heat = nullptr,       // optional per-expert route counters, incremented by this dispatch
-		int top_k = 8                   // routes per row
+		int top_k = 8,                  // routes per row
+		int* route_pos = nullptr        // optional [rows * top_k]: each route's position in token_sorted, -1 for another rank's expert
 	);
 };
 

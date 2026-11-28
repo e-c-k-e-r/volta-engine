@@ -5,7 +5,7 @@
 
 namespace engine::modules {
 
-__attribute__(( weak )) void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::half_t* routing_weights, int64_t* expert_count, int64_t* token_sorted, backend::half_t* weight_sorted, int* cursors, int num_experts, int routing_first, int routing_last, int4* active_experts, backend::stream_t stream, int rows, int chunk_rows, uint32_t* heat, int top_k ) {
+__attribute__(( weak )) void MoERouter::exl3_moe_dispatch( const int* selected_experts, const backend::half_t* routing_weights, int64_t* expert_count, int64_t* token_sorted, backend::half_t* weight_sorted, int* cursors, int num_experts, int routing_first, int routing_last, int4* active_experts, backend::stream_t stream, int rows, int chunk_rows, uint32_t* heat, int top_k, int* route_pos ) {
 	ENGINE_UNSUPPORTED( "MoERouter::exl3_moe_dispatch" );
 	__builtin_unreachable();
 }

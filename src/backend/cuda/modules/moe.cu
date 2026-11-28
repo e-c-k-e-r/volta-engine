@@ -114,11 +114,13 @@ __global__ void moe_dispatch_scatter_kernel(
 	const int routing_last,
 	int64_t* __restrict__ token_sorted,
 	half* __restrict__ weight_sorted,
-	int* __restrict__ cursors
+	int* __restrict__ cursors,
+	int* __restrict__ route_pos
 ) {
 	int i = blockIdx.x * blockDim.x + threadIdx.x;
 	if ( i >= n ) return;
 	int e = selected_experts[i];
+	if ( route_pos != nullptr && !( e >= routing_first && e < routing_last ) ) route_pos[i] = -1;
 	if ( e >= routing_first && e < routing_last ) {
 		// Position = the expert's start + the number of earlier routes to it, so every expert's rows are in route order
 		// and a chunk always holds the same tokens (an atomic cursor made the order, and with it the chunk-to-group
@@ -128,6 +130,7 @@ __global__ void moe_dispatch_scatter_kernel(
 		const int pos = cursors[e - routing_first] + rank;
 		token_sorted[pos] = static_cast<int64_t>( i / top_k );
 		weight_sorted[pos] = routing_weights[i];
+		if ( route_pos != nullptr ) route_pos[i] = pos;
 	}
 }
 
@@ -382,6 +385,58 @@ void router_softmax_select_kernel(
 		topk_indices[lane] = s_sel[lane];
 		topk_weights[lane] = __float2half_rn( ex / sum );
 	}
+}
+
+// The persistent kernel's route-out mode (prefill chunks): row pos of route_out holds route pos's down projection in its rotated basis. A warp
+// per (row, 128-wide chunk) sums the row's local routes in route order: each chunk through the 128-point Hadamard (the shuffle of
+// had_hf_r_128_d_inner), times w / sqrt(128) and the expert's output scales (svh), in FP32, rounded to FP16 once
+__global__ void moe_combine_routes_kernel(
+	const half* __restrict__ route_out,
+	const int* __restrict__ route_pos,
+	const int* __restrict__ sel,
+	const half* __restrict__ route_w,
+	const half* const* __restrict__ down_svh,
+	int routing_first,
+	int rows,
+	int top_k,
+	int hidden,
+	half* __restrict__ out
+) {
+	const int warp = static_cast<int>( ( blockIdx.x * static_cast<size_t>( blockDim.x ) + threadIdx.x ) >> 5 ), lane = threadIdx.x & 31;
+	const int chunks = hidden / 128;
+	if ( warp >= rows * chunks ) return;
+	const int row = warp / chunks, c = warp % chunks;
+	float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+	for ( int k = 0; k < top_k; ++k ) {
+		const int pos = route_pos[row * top_k + k];
+		if ( pos < 0 ) continue;
+		const uint2 raw = reinterpret_cast<const uint2*>( route_out + static_cast<size_t>( pos ) * hidden + c * 128 )[lane];
+		const float2 a = __half22float2( *reinterpret_cast<const half2*>( &raw.x ) ), b = __half22float2( *reinterpret_cast<const half2*>( &raw.y ) );
+		const float s0 = a.x + a.y, d0 = a.x - a.y, s1 = b.x + b.y, d1 = b.x - b.y;
+		float h0 = s0 + s1, h1 = d0 + d1, h2 = s0 - s1, h3 = d0 - d1;
+		#pragma unroll
+		for ( int i = 1; i < 32; i <<= 1 ) {
+			const float p0 = __shfl_xor_sync( 0xffffffffu, h0, i ), p1 = __shfl_xor_sync( 0xffffffffu, h1, i );
+			const float p2 = __shfl_xor_sync( 0xffffffffu, h2, i ), p3 = __shfl_xor_sync( 0xffffffffu, h3, i );
+			const bool upper = ( lane & i ) != 0;
+			h0 = ( upper ? -h0 : h0 ) + p0;
+			h1 = ( upper ? -h1 : h1 ) + p1;
+			h2 = ( upper ? -h2 : h2 ) + p2;
+			h3 = ( upper ? -h3 : h3 ) + p3;
+		}
+		const float r = 0.088388347648f * __half2float( route_w[row * top_k + k] );
+		const uint2 sraw = reinterpret_cast<const uint2*>( down_svh[sel[row * top_k + k] - routing_first] + c * 128 )[lane];
+		const float2 sa = __half22float2( *reinterpret_cast<const half2*>( &sraw.x ) ), sb = __half22float2( *reinterpret_cast<const half2*>( &sraw.y ) );
+		acc0 += h0 * r * sa.x;
+		acc1 += h1 * r * sa.y;
+		acc2 += h2 * r * sb.x;
+		acc3 += h3 * r * sb.y;
+	}
+	const half2 o01 = __floats2half2_rn( acc0, acc1 ), o23 = __floats2half2_rn( acc2, acc3 );
+	uint2 w;
+	w.x = *reinterpret_cast<const uint32_t*>( &o01 );
+	w.y = *reinterpret_cast<const uint32_t*>( &o23 );
+	reinterpret_cast<uint2*>( out + static_cast<size_t>( row ) * hidden + c * 128 )[lane] = w;
 }
 
 // out = sum over group planes in group order (fixed order, so the result is independent of group timing)
@@ -654,7 +709,8 @@ void MoERouter::exl3_moe_dispatch(
 	int rows,
 	int chunk_rows,
 	uint32_t* heat,
-	int top_k
+	int top_k,
+	int* route_pos
 ) {
 	const int n = top_k * rows;
 	int device = 0;
@@ -688,7 +744,8 @@ void MoERouter::exl3_moe_dispatch(
 		routing_last,
 		token_sorted,
 		weight_sorted,
-		cursors
+		cursors,
+		route_pos
 	);
 }
 
@@ -828,7 +885,10 @@ pod::MoEScratch MoE::alloc_scratch(
 	int max_rows,
 	bool nvfp4
 ) {
-	const int groups = MOE_MAX_GROUPS;
+	// per-group buffers for the most groups a call takes (16 for sharded prefill chunks, more with moe_groups); the planes for 8 groups of max_rows rows
+	// (moe_route_out=false prefill with more groups: as many as moe_groups asks for), and at least a row per route of max_rows rows
+	const int groups = std::min( MOE_MAX_GROUPS, std::max( 16, engine::runtime::options().moe_groups ) );
+	const int plane_groups = engine::runtime::options().moe_route_out ? 8 : std::min( MOE_MAX_GROUPS, std::max( 8, engine::runtime::options().moe_groups ) );
 	const size_t E1 = static_cast<size_t>( num_local_experts ) + 1;
 	pod::MoEScratch s;
 	s.expert_count = static_cast<int64_t*>( engine::core::arena_alloc( arena, E1 * sizeof( int64_t ) ) );
@@ -843,8 +903,10 @@ pod::MoEScratch MoE::alloc_scratch(
 	s.state_u = static_cast<half*>( engine::core::arena_alloc( arena, state_elems * sizeof( half ) ) );
 	s.interm_g = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
 	s.interm_u = static_cast<half*>( engine::core::arena_alloc( arena, interm_elems * sizeof( half ) ) );
-	s.planes_bytes = static_cast<size_t>( groups ) * max_rows * hidden_size * sizeof( half );
+	// the planes hold a group's output each, or in the route-out prefill a row per route
+	s.planes_bytes = static_cast<size_t>( std::max( plane_groups, top_k ) ) * max_rows * hidden_size * sizeof( half );
 	s.planes = static_cast<half*>( engine::core::arena_alloc( arena, s.planes_bytes ) );
+	s.route_pos = static_cast<int*>( engine::core::arena_alloc( arena, static_cast<size_t>( top_k ) * max_rows * sizeof( int ) ) );
 	// Fused decode path: the rotated inputs and the gate/up partials alias the persistent kernel's staging buffers (a call runs
 	// one path or the other, in stream order); the activation and the down partials are its own
 	if ( hidden_size % 128 == 0 && intermediate_size % 128 == 0 ) {
@@ -914,7 +976,17 @@ void MoE::forward(
 	// Sharded experts (every rank runs every active expert, a quarter wide) want all groups at any row count: the active experts
 	// are few per token but each pass is short, so the fixed phase costs hide behind the other groups
 	const bool sharded = weights.num_local_experts > 72;
-	const int num_groups = sharded ? MOE_MAX_GROUPS : rows == 1 ? 1 : rows <= 16 ? 4 : MOE_MAX_GROUPS;
+	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
+	const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
+	// Route-out (prefill chunks of trellis experts): the kernel writes every route's down projection to its own row of the planes buffer, and the
+	// combine kernel sums a token's routes in route order (no per-group planes, no plane memset or sum), so the group count no longer costs memory:
+	// 16 groups of 10 blocks (GLM at 4096 rows: sharded experts 46.2 -> 38.2 ms a layer, whole experts 31.3 -> 30.6)
+	const bool route_out = wide == 3 && runtime::options().moe_route_out && weights.type == pod::QuantType::TRELLIS && scratch.route_pos != nullptr &&
+		static_cast<size_t>( weights.top_k ) * plane_elems * sizeof( half ) <= scratch.planes_bytes;
+	const int prefill_groups = runtime::options().moe_groups > 0 ? std::min( MOE_MAX_GROUPS, runtime::options().moe_groups ) : route_out ? 16 : 8;
+	int num_groups = wide == 3 ? prefill_groups : sharded ? 8 : rows == 1 ? 1 : rows <= 16 ? 4 : 8;
+	// the planes hold num_groups chunks of rows
+	if ( !route_out && static_cast<size_t>( num_groups ) * plane_elems * sizeof( half ) > scratch.planes_bytes ) num_groups = 8;
 	// Fused decode path: gate/up and down GEMV kernels over runs of rows that share an expert (exl3_moe_coop.cuh)
 	// 1 to 4 bpw and the half-integer rates, mul1 experts (the int8 tile or the tensor-core one, by width, rows and tile order)
 	if ( weights.type == pod::QuantType::GGUF ) {
@@ -1043,9 +1115,8 @@ void MoE::forward(
 #endif
 		return;
 	}
-	const size_t plane_elems = static_cast<size_t>( rows ) * out.shape[out.ndim - 1];
-	half* target = ( num_groups == 1 ) ? out.ptr<half>() : scratch.planes;
-	CUDA_CHECK( cudaMemsetAsync( target, 0, plane_elems * num_groups * sizeof( half ), stream ) );
+	half* target = route_out || num_groups > 1 ? scratch.planes : out.ptr<half>();
+	if ( !route_out ) CUDA_CHECK( cudaMemsetAsync( target, 0, plane_elems * num_groups * sizeof( half ), stream ) );
 
 	switch ( weights.type ) {
 		case pod::QuantType::TRELLIS: {
@@ -1057,7 +1128,6 @@ void MoE::forward(
 			auto kok = []( int b ) { return ( b >= 1 && b <= 6 ) || ( b >= 9 && b <= 11 ); };
 			ENGINE_ASSERT( kok( K_gate ) && kok( K_up ) && kok( K_down ), "MoE::forward: persistent trellis MoE kernel is instantiated for 1 to 6-bit experts (6: one width for gate, up and down) and 1.5 / 2.5 / 3.5 bpw" );
 
-			const int wide = rows > 128 && runtime::options().moe_prefill_tile ? 3 : rows > 8 ? 2 : 0;
 			// moe_heavy_rows: the experts of this chunk routed by at least that many rows run as FP16 dequantization + a tensor-core GEMM after the
 			// quantized kernel has done the others (their routes are masked out of a second dispatch); none heavy, the first dispatch stands
 			struct Heavy { int e, count, off; };
@@ -1068,9 +1138,12 @@ void MoE::forward(
 			const HeavyBufs hb = scratch.heavy_ws != nullptr ? heavy_bufs( scratch, E, H, Iw ) : HeavyBufs{};
 			// (the heavy experts' dequantization reads plain trellises: extended experts stay in the quantized kernel)
 			const bool plan = scratch.heavy_ws != nullptr && heavy_min > 0 && rows >= heavy_min && routes <= scratch.heavy_routes && hb.piece >= 64 && weights.ext_ptrs == nullptr;
+			const int* routed = d_topk_indices;   // the selection the last dispatch sorted (the combine reads the experts' scales by it)
 			auto dispatch = [&]( const int* sel, uint32_t* heat ) {
 				MoERouter::exl3_moe_dispatch( sel, d_topk_weights, scratch.expert_count, scratch.token_sorted, scratch.weight_sorted, scratch.cursors, E,
-					start_expert, end_expert, scratch.active_experts, stream, rows, wide == 3 ? 32 : wide == 2 ? 16 : 4, heat, weights.top_k );
+					start_expert, end_expert, scratch.active_experts, stream, rows, wide == 3 ? 32 : wide == 2 ? 16 : 4, heat, weights.top_k,
+					route_out ? scratch.route_pos : nullptr );
+				routed = sel;
 			};
 			dispatch( d_topk_indices, weights.heat );
 			if ( plan ) {
@@ -1136,7 +1209,7 @@ void MoE::forward(
 				-1,
 				scratch.active_experts,
 				num_groups,
-				plane_elems,
+				route_out ? 0 : plane_elems,
 				wide,
 				weights.up[0].w1.shape[0],      // hidden: the length of suh
 				weights.up[0].w2.shape[0],      // this rank's intermediate width: the length of svh (2048, or 512 when sharded)
@@ -1146,7 +1219,13 @@ void MoE::forward(
 				weights.bits_dev, weights.bits_half,
 				static_cast<const void* const*>( weights.ext_ptrs )
 			);
-			if ( num_groups > 1 ) {
+			if ( route_out ) {
+				const int H_out = static_cast<int>( out.shape[out.ndim - 1] );
+				const size_t warps = static_cast<size_t>( rows ) * ( H_out / 128 );
+				moe_combine_routes_kernel<<<static_cast<unsigned>( ( warps * 32 + 255 ) / 256 ), 256, 0, stream>>>( scratch.planes, scratch.route_pos, routed, d_topk_weights,
+					down_svh, start_expert, rows, weights.top_k, H_out, out.ptr<half>() );
+			}
+			else if ( num_groups > 1 ) {
 				if ( plane_elems % 8 == 0 && num_groups <= MOE_MAX_GROUPS ) {
 					moe_sum_planes8_kernel<<<dim3( ( plane_elems / 8 + 255 ) / 256 ), dim3( 256 ), 0, stream>>>(
 						scratch.planes, out.ptr<half>(), static_cast<int>( plane_elems / 8 ), num_groups );

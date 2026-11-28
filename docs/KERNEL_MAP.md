@@ -13,7 +13,7 @@ the tests are described in [TESTS.md](TESTS.md). `gate.sh sass` fingerprints eve
 | Dequantize for large M (recon + the FP16 GEMM) | `reconstruct.cu`, `exl3_dq.cuh`, `codebook.cuh` | `test_trellis`, `test_ops_linear`, `test_trellis_layout` |
 | Extended trellis decode (tile start states, tile gains) | `exl3_dq_ext.cuh` | `test_exl3_encode`, `test_moe` (`MOE_SYNTH=1 MOE_EXT=1`) |
 | Hadamard rotation | `hadamard.cu`, `hadamard_inner.cuh` | `test_trellis` |
-| Fused MoE (persistent and cooperative, int8 tile) | `exl3_moe_kernel.cuh`, `exl3_moe_launch.cu`, `exl3_moe_coop.cu`, `exl3_moe_common.cuh` | `test_moe`, `test_ops_moe`, `bench_moe_prefill`, `bench_moe_routes` |
+| Fused MoE (persistent and cooperative, int8 tile; prefill chunks write each route's down projection to its own row, summed per token by `moe.cu`'s combine kernel) | `exl3_moe_kernel.cuh`, `exl3_moe_launch.cu`, `exl3_moe_coop.cu`, `exl3_moe_common.cuh` | `test_moe`, `test_ops_moe`, `bench_moe_prefill`, `bench_moe_routes` |
 | Volta tile order copies (every unit above compiled a second time in namespace `exl3_vl` on SM_70 builds) | `exl3_vl.cuh`, `exl3_vl_prelude.cuh`, `exl3_vl_unit.cu.in` | `test_trellis_order`, `bench_trellis_order` |
 | Workspace state | `trellis_context.cu/.h` | used by every kernel above |
 | Quantizer: trellis encoder (Viterbi over a tile's ring, integer and half-integer rates) and the GPU quantization steps (`engine_quant`) | `quant/exl3_encode*.cu`, `quant/exl3_encode_kernel.cuh`, `quant/exl3_quantize.cu` | `test_exl3_encode`, `test_exl3_quantize` |
@@ -59,7 +59,7 @@ and `test_ops_moe`.
 | `ple.cu` (with the host table reader `src/loader/ngram_table.cpp`: mul1 ring codec, hashing) | Flash-Next n-gram embedding layer: gate, grouped norms, dilated conv ring | `test_ops_flash`, `test_prefix_restore --model qwen4_exp` |
 | `qsa.cu` (+ `attention.cu` `forward_sparse`, `dsa.cu` `select`) | Flash-Next QSA indexer: q / k prep, pooled keys, scoring, token-list sparse GQA attention | `test_sparse_attn`, `test_ops_flash`, `test_longctx --model qwen4_exp` (`gate.sh needle`) |
 | `dsa.cu` | indexer projection, plane / pool update, score, top-k select | `test_dsa` (FP64 reference) |
-| `moe.cu`, `expert_tier.cu` | router, dispatch histogram / scatter, combine, two-tier expert residency | `test_moe`, `test_ops_moe` |
+| `moe.cu`, `expert_tier.cu` | router, dispatch histogram / scatter, combine (per-group planes, or the prefill chunks' rows per route: each token's routes rotated, scaled and summed in route order), two-tier expert residency | `test_moe`, `test_ops_moe` |
 | `cpu_experts.cu` | the device half of the CPU expert path: post the routes handed to the CPU, wait for its answer, add it | `test_cpu_bridge` |
 | `mhc.cu` | hyper-connection mix, collapse + norm, update | `test_mhc`, `test_slang_kernels`, `bench_mhc` |
 | `dsv4.cu` | DeepSeek-V4.1: window ring store, KV compressor (the caches as packed FP8 / FP4 codes, decoded in the readers), indexer (scalar and tensor-core scorer, top-k select), window + selected-entry attention (one block a row; tensor-core split-KV for decode, verify and the DSpark drafter), DSpark taps, routing, Engram gate, FP8 projections | `test_dsv4_indexer`, `test_dsv4_fp8`, `test_dsv4_engram`, `bench_dsv4_attend`, `test_dsv41` |
