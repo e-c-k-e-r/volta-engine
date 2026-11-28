@@ -44,6 +44,8 @@ TensorPath tensor_path();
 bool cuda_gemm_tn( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, int k_split, stream_t stream, int ldc = 0 );
 // The NVFP4 W4A16 linear out[m, n] = x[m, k] W^T on the CUDA backend's kernels (the prepacked codes and scales, the global scale as stored),
 // false where the tensor path is not CudaLaunch or the rows are a chunk for the dequantization and the FP16 GEMM
+// The vision towers' bidirectional attention (head_dim 64 or 72) on the CUDA backend's Volta kernel; false where it does not apply
+bool cuda_vision_attention( const void* q, const void* k, const void* v, void* out, int m, int heads, int head_dim, float scale, stream_t stream );
 bool cuda_nvfp4_linear( const void* codes, const void* scales, const void* x, void* out, int m, int n, int k, float gscale, stream_t stream );
 // The tensor-core attention (src/kernels/cuda/attention/attn_prefill_vk.cu) over rows of one slot or a row each, any cache format, head_dim 256 or 512: the
 // key tiles over `splits` blocks, whose partials go to part in fa.slang's layout for fa_reduce (splits 1: the output, gated, straight to out).

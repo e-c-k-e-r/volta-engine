@@ -48,8 +48,10 @@ int main( int argc, char** argv ) {
 	std::printf( "[*] experts: bits g/u/d = %d/%d/%d, mul1 g/u/d = %d/%d/%d\n",
 		mw.gate[0].bits, mw.up[0].bits, mw.down[0].bits, mw.gate[0].mul1, mw.up[0].mul1, mw.down[0].mul1 );
 
-	// Reference: the dense decode kernels on one expert matrix (gate: 4096 -> 2048, 3 bit), rows 1..16
+	// Reference: the dense decode kernels on one expert matrix (gate: 4096 -> 2048, 3 bit), rows 1..16; an extended trellis runs only on the
+	// MoE paths
 	for ( int Rg : { 1, 4, 8, 16 } ) {
+		if ( mw.gate[0].extended() ) break;
 		int xs[2] = { Rg, H }, ys[2] = { Rg, I };
 		auto xg = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, xs, 2 );
 		auto yg = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, ys, 2 );

@@ -11,6 +11,7 @@
 #include "trellis_context.h"
 #endif
 #include <nlohmann/json.hpp>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -67,6 +68,18 @@ int llama_check( const std::string& model, const std::string& golden, const std:
 	if ( !tower.encode( img, &emb, stream ) ) {
 		std::printf( "test_gemma4_vision: FAIL (encode)\n" );
 		return 1;
+	}
+	{
+		// the encode time at this size and at the tower's largest image
+		loader::PreparedImage big;
+		loader::prepare_image( dec, tower.params(), &big, &err );
+		for ( const loader::PreparedImage* p : { &img, &big } ) {
+			std::vector<backend::half_t> tmp;
+			tower.encode( *p, &tmp, stream );
+			const auto t0 = std::chrono::steady_clock::now();
+			for ( int i = 0; i < 3; ++i ) tower.encode( *p, &tmp, stream );
+			std::printf( "  encode %d patches: %.1f ms\n", p->num_patches(), std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() / 3 );
+		}
 	}
 	const int hidden = g["hidden"].get<int>(), tokens = static_cast<int>( emb.size() / hidden );
 	bool ok = tokens == g["tokens"].get<int>();

@@ -1,5 +1,6 @@
 // Vulkan backend: the vision-tower operators on the Slang kernels of src/kernels/slang/vision.slang (norms, patch embedding, interpolated position
 // table, rotary with biases, bidirectional attention, bias / activation / residual helpers, the merger's gather); the dense GEMM is the plain FP16 GEMM.
+// Where the device launches CUDA kernels (Volta) the attention and the patch embedding's GEMM run the CUDA backend's tensor-core kernels.
 #include "mod_attention.h"
 #include "mod_common.h"
 #include "engine/modules/linear.h"
@@ -28,6 +29,11 @@ void Vision::pos_interp( const backend::half_t* table, backend::half_t* out, int
 }
 
 void Vision::patch_embed( const backend::half_t* patches, const backend::half_t* w, const backend::half_t* bias, const backend::half_t* add, float* out, int m, int n, int k, backend::stream_t stream ) {
+	// the tensor-core GEMM with FP32 out where the device launches CUDA kernels, then the bias and the added rows
+	if ( add != nullptr && bias != nullptr && vki::cuda_gemm_tn( w, patches, out, m, n, k, true, 0, stream, n ) ) {
+		bias_residual( out, add, bias, m, n, stream );
+		return;
+	}
 	vki::PatchEmbedParams p{ vki::dp( patches ), vki::dp( w ), vki::dp( bias ), vki::dp( add ), vki::dp( out ), m, n, k, add != nullptr ? 1 : 0 };
 	vki::launch( "vision_patch_embed", p, stream, tiles( n, 64 ), m );
 }
@@ -92,6 +98,7 @@ void Vision::dense_gemm( const backend::half_t* a, const backend::half_t* w, bac
 
 // The tiled attention (fa_attn without slots) where its head_dim applies (a multiple of 16), else the SIMT kernel
 void Vision::attention( const backend::half_t* q, const backend::half_t* k, const backend::half_t* v, backend::half_t* out, int m, int heads, int head_dim, float scale, backend::stream_t stream ) {
+	if ( vki::cuda_vision_attention( q, k, v, out, m, heads, head_dim, scale, stream ) ) return;
 	if ( head_dim % 16 == 0 && head_dim <= 512 ) vk_attn::dense( q, k, v, out, m, m, heads, heads, head_dim, scale, stream );
 	else attention_simt( q, k, v, out, m, heads, head_dim, scale, stream );
 }

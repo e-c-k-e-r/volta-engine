@@ -304,13 +304,15 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	else()
 		message(STATUS "glslc not found: the Vulkan GGUF projections run on the Slang kernels alone")
 	endif()
-	# The CUDA backend's FP16 tensor-core GEMM and NVFP4 linear kernels and a tensor-core prefill attention as PTX for the launches through
+	# The CUDA backend's FP16 tensor-core GEMM and NVFP4 linear kernels, a tensor-core prefill attention and the vision towers' attention as PTX
+	# for the launches through
 	# VK_NV_cuda_kernel_launch (NVIDIA GPUs without cooperative matrices: Volta; src/backend/vulkan/mod_cuda.cpp), where nvcc is found
 	find_program(ENGINE_NVCC nvcc HINTS /opt/cuda/bin /usr/local/cuda/bin ENV CUDA_PATH PATH_SUFFIXES bin)
 	if(ENGINE_NVCC)
 		set(KDIR ${PROJECT_SOURCE_DIR}/src/kernels/cuda)
 		foreach(ptx "cuda_gemm|gemm/gemm_f16_vk.cu|gemm/gemm_f16_kernel.cuh" "cuda_nvfp4|nvfp4/nvfp4_vk.cu|nvfp4/nvfp4_linear_kernels.cuh;nvfp4/nvfp4_common.cuh;nvfp4/nvfp4_frag.h;mma_sm80.cuh;mma_frag.h"
-			"cuda_attn|attention/attn_prefill_vk.cu|mma_sm80.cuh;mma_frag.h;../../backend/cuda/modules/kv_quant.cuh")
+			"cuda_attn|attention/attn_prefill_vk.cu|mma_sm80.cuh;mma_frag.h;../../backend/cuda/modules/kv_quant.cuh"
+			"cuda_vision|attention/vision_attn_vk.cu|mma_sm80.cuh;mma_frag.h;../../backend/cuda/modules/vision_attn_mma.cuh")
 			string(REPLACE "|" ";" parts "${ptx}")
 			list(GET parts 0 name)
 			list(GET parts 1 src)

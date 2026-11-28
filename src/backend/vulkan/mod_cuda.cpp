@@ -2,7 +2,8 @@
 // mid-size chunks run the CUDA backend's kernels (src/kernels/cuda/gemm/gemm_f16_kernel.cuh, src/kernels/cuda/nvfp4/nvfp4_linear_kernels.cuh;
 // the PTX entry points of gemm_f16_vk.cu and nvfp4_vk.cu, <kernel dir>/cuda_gemm.ptx and cuda_nvfp4.ptx) launched from the command buffers
 // through VK_NV_cuda_kernel_launch, with gemm_f16.cu's tiles by row count and its split along k and skinny_kernels.cu's kernel by row count;
-// the attention runs src/kernels/cuda/attention/attn_prefill_vk.cu (cuda_attn.ptx), sized for a launch's 48 KiB of shared memory.
+// the attention runs src/kernels/cuda/attention/attn_prefill_vk.cu (cuda_attn.ptx), sized for a launch's 48 KiB of shared memory, and the
+// vision towers' attention vision_attn_vk.cu (cuda_vision.ptx, vision.cu's Volta kernel); the vision patch embedding takes the GEMM with FP32 out.
 // Devices with cooperative matrices would take shaders of their own beside this (tensor_path); the others keep the shader-core kernels.
 #include "mod_common.h"
 #include <algorithm>
@@ -133,6 +134,20 @@ bool cuda_attn_prefill( const AttnPrefillArgs& a, stream_t stream ) {
 	// attn_prefill_vk.cu's 32 query vectors (or a row's) a block, 256 threads, its 46976 bytes of shared memory
 	vk::cuda_launch( stream, fn, static_cast<uint32_t>( a.num_kv_heads ), static_cast<uint32_t>( ( a.count * G + tile_q - 1 ) / tile_q ),
 		static_cast<uint32_t>( a.splits ), 256, 1, 1, 46976, params, 23 );
+	return true;
+}
+
+bool cuda_vision_attention( const void* q, const void* k, const void* v, void* out, int m, int heads, int head_dim, float scale, stream_t stream ) {
+	if ( tensor_path() != TensorPath::CudaLaunch || ( head_dim != 64 && head_dim != 72 ) || m <= 0 ) return false;
+	vk::CudaFunction* fn = function( head_dim == 64 ? "vk_vision_attn_64" : "vk_vision_attn_72", "cuda_vision" );
+	if ( fn == nullptr ) return false;
+	const void* qp = q;
+	const void* kp = k;
+	const void* vp = v;
+	void* op = out;
+	const void* params[7] = { &qp, &kp, &vp, &op, &m, &heads, &scale };
+	// vision.cu's launch: 4 warps of 16 queries a block, a block row per head
+	vk::cuda_launch( stream, fn, static_cast<uint32_t>( ( m + 63 ) / 64 ), static_cast<uint32_t>( heads ), 1, 128, 1, 1, 0, params, 7 );
 	return true;
 }
 

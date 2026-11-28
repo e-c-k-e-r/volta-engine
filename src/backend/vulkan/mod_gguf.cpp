@@ -534,15 +534,17 @@ bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int
 	return ggml_f16_matmul( w, x, out, m, n, k, false, stream, 0 );
 }
 
-// The matmul alone (FP16 or FP32 output): ALIGNED drops the K bound checks, so k (and k_split) a multiple of the tiles' BK of 32. A split K
+// The matmul alone (FP16 or FP32 output): ALIGNED drops the K bound checks, so k (and k_split) a multiple of the tiles' BK of 32 (the CUDA
+// GEMM, where it runs, takes multiples of 8). A split K
 // runs ceil( k / k_split ) times as many workgroups (the shader's split index is the x group over the row blocks), each slab's partial in its own
 // m x n of out
 bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split ) {
 	using namespace ::engine::modules;
 	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
-	if ( k % 32 != 0 || k_split % 32 != 0 || !aligned( w ) || !aligned( x ) || !aligned( out ) ) return false;
-	// the tensor cores where the device has a path to them (the same output and slab layout)
-	if ( cuda_gemm_tn( w, x, out, m, n, k, f32_out, k_split > 0 && k_split < k ? k_split : 0, stream ) ) return true;
+	if ( !aligned( w ) || !aligned( x ) || !aligned( out ) ) return false;
+	// the tensor cores where the device has a path to them (the same output and slab layout; K a multiple of 8)
+	if ( k_split % 8 == 0 && cuda_gemm_tn( w, x, out, m, n, k, f32_out, k_split > 0 && k_split < k ? k_split : 0, stream ) ) return true;
+	if ( k % 32 != 0 || k_split % 32 != 0 ) return false;
 	if ( k_split <= 0 || k_split > k ) k_split = k;
 	const uint32_t splits = static_cast<uint32_t>( ( k + k_split - 1 ) / k_split );
 	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );

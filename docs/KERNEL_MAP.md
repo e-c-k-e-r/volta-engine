@@ -63,7 +63,7 @@ and `test_ops_moe`.
 | `mhc.cu` | hyper-connection mix, collapse + norm, update | `test_mhc`, `test_slang_kernels`, `bench_mhc` |
 | `dsv4.cu` | DeepSeek-V4.1: window ring store, KV compressor (the caches as packed FP8 / FP4 codes, decoded in the readers), indexer (scalar and tensor-core scorer, top-k select), window + selected-entry attention (one block a row; tensor-core split-KV for decode, verify and the DSpark drafter), DSpark taps, routing, Engram gate, FP8 projections | `test_dsv4_indexer`, `test_dsv4_fp8`, `test_dsv4_engram`, `bench_dsv4_attend`, `test_dsv41` |
 | `norm.cu`, `rope.cu`, `swiglu.cu`, `embedding.cu` | RMSNorm (plain, heads, gated), RoPE, SwiGLU, embedding gather | `test_norm`, `test_rope`, `test_slang_kernels` |
-| `vision.cu` | vision tower operators: patch-embedding GEMM, LayerNorm, qkv bias + 2-D rotary, register-resident mma.m8n8k4 flash attention (head_dim 64 / 72; WMMA fallback up to 80), bias + GELU / SiLU, position-embedding interpolation; Gemma 4's audio tower: the clipped projections' clamp, the GLU through causal depthwise taps, local attention with relative position keys and a softcap | `test_vision`, `test_ops_vision`, `test_gemma4_audio` |
+| `vision.cu` | vision tower operators: patch-embedding GEMM, LayerNorm, qkv bias + 2-D rotary, register-resident mma.m8n8k4 flash attention (head_dim 64 / 72, `vision_attn_mma.cuh`, also the Vulkan backend's CUDA launch; WMMA fallback up to 80), bias + GELU / SiLU, position-embedding interpolation; Gemma 4's audio tower: the clipped projections' clamp, the GLU through causal depthwise taps, local attention with relative position keys and a softcap | `test_vision`, `test_ops_vision`, `test_gemma4_audio` |
 | `linear_trellis.cu` | trellis `Linear` dispatch (GEMM / GEMV / recon by M) | `test_ops_linear`, `bench_decode` |
 | `steer.cu` | runtime steering: residual edit (plain and hyper-connection streams), probe scores, logit penalty | `test_steer`, `test_steer_probe`, `test_steer_model` |
 | `sparse_head.cu` | sparse drafter head: column extraction through identity rows, subset logits, scatter | `test_sparse_head`, `bench_sparse_head` |
@@ -123,7 +123,9 @@ tensor-core tiles of attention.cu's prefill kernel on 32-key tiles within a laun
 buffer, every cache format through the CUDA backend's codecs, a block per 32 query vectors of a slot or per row, its key splits merged by
 `fa_reduce`), held against `ref_attention` by the same test. Without a cache (no slots) `fa_attn` attends dense rows to every key,
 and `fa_dense_64` is the head_dim 64 form of that (a thread per query with its accumulators in registers, a warp per quarter of each 64-key tile,
-FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`). `attn_prep.slang`'s `norm_rope_store` is
+FP32 scores): bidirectional attention for the TTS backbone and the vision towers (`test_ops_vision`, `tts_generate --golden`); where the device
+launches CUDA kernels the vision towers at head_dim 64 and 72 take `src/kernels/cuda/attention/vision_attn_vk.cu` instead (`cuda_vision.ptx`: the
+CUDA backend's register-resident Volta kernel, `vision_attn_mma.cuh`, shared with `vision.cu`). `attn_prep.slang`'s `norm_rope_store` is
 the step before the attention in one kernel (`Attention::norm_rope_store`: q / k / v head norms, the rotary embedding of q and k, k and v into
 an FP16 cache, a group per row and head), bit for bit the three kernels it replaces; other cache formats take those three. `gdn_chunk.slang` is the
 Vulkan form of the GDN prefill's chunked delta rule (the CUDA kernels' three steps in FP32 on the shader cores, held against the rows kernel and the

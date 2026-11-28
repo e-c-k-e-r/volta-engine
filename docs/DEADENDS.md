@@ -43,11 +43,18 @@ from the hardware of the time (4x V100, power caps as noted); relative results a
 * **DeepInfer-style confidence-scheduled verification (DeepSeek DSpark, one stream).** 32.0 ms per token against 41.4 for fixed blocks,
   the same as a plain threshold; its gain comes from a budget shared across a large batch.
 
+* **The Flash-Next shared expert rotated over the ranks** (layer L's on rank L mod tp, instead of all on rank 0): the per-rank kernel time evened
+  out as intended (rank 0 -88 ms, the others +27 ms over a 4096-token prefill) but the prefill got 4% slower (1826 vs 1758 ms), idle gaps
+  appearing on every rank; estimated from the per-layer critical path, moving it at all (rotated or split four ways) is worth about 1%, since
+  the slowest rank of a layer is set by the routed experts' imbalance between the contiguous 128-expert blocks.
+
 ## MoE kernels
 
 * **64-row expert tile, first version** (512 threads, 4 row blocks): correct but 30.3 vs 14.7 ms at 1024 rows; it spilled at 128 registers.
   The later 32-row tile at 2 blocks per SM is what shipped.
 * **`__launch_bounds__(256,2)` with exact shared memory and a doubled grid**, on its own: 16.5 vs 14.7 ms.
+* **64-row expert chunks for the prefill kernel at 2 blocks per SM** (the 64-row tile above 32 rows, chunks of 64 instead of 32, the shared
+  memory sized for it): 2.5x slower at 1024 to 8192 rows (4096: 80 vs 32 ms per layer), the tile spilling at the 2-block register budget.
 * **Deferred shared-memory stores for the emulated `cp.async`** (loads into registers before the barrier): 19-27% slower; the kernel is
   pinned at 128 registers and spills.
 * **L2 prefetch of the B tile ahead of the pipeline:** +8% / -1% / -3% at 512 / 1024 / 2048 rows.
