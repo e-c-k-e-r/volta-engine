@@ -151,10 +151,12 @@ bool Glm5NextPipeline::init(
 	// Routed experts: sharded over the ranks (every rank holds a quarter of every expert's intermediate width, moe_tp,
 	// default) or expert-parallel (72 whole experts per rank, forced by the two-tier expert cache). The sharded layout balances
 	// the load: each active expert costs every rank the same, where expert-parallel waits for the rank that drew the most.
-	moe_tp_ = engine::modules::ExpertTier::resident_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
+	// expert_shard=0 keeps whole experts with every expert resident too
+	const bool shard_ok = runtime::options().expert_shard != 0;
+	moe_tp_ = shard_ok && engine::modules::ExpertTier::resident_fraction() >= 1.0 && config_.tp_size == ENGINE_NUM_GPUS;
 	// expert_cache=auto plans the residency only once the other weights are in: when every rank then holds all of its experts, the experts load
 	// sharded after all (load_experts). Not with the MTP head or NVFP4 expert layers, which take their layout in load_weights
-	moe_tp_auto_ = engine::modules::ExpertTier::resident_fraction() <= 0.0 && config_.tp_size == ENGINE_NUM_GPUS && !mtp_on_ &&
+	moe_tp_auto_ = shard_ok && engine::modules::ExpertTier::resident_fraction() <= 0.0 && config_.tp_size == ENGINE_NUM_GPUS && !mtp_on_ &&
 		runtime::options().nvfp4_expert_layers.empty() && runtime::options().expert_synth == 0 && !runtime::options().expert_stream;
 	const int E_local = moe_tp_ || moe_tp_auto_ ? config_.num_experts : config_.num_experts / config_.tp_size;
 

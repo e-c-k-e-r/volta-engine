@@ -1,6 +1,7 @@
 // Prefill throughput: tokens/s for a synthetic prompt at several chunk sizes. BENCH_PROFILE=1 brackets the final run
 // with cudaProfilerStart/Stop for nvprof --profile-from-start off. BENCH_GLM=1 / BENCH_FLASH=1 pick GLM / Flash-Next (default Qwen); BENCH_TP sets the rank count.
 // BENCH_TEXT=file: the prompt is the file's first tokens instead of random ids (a MoE model's routes then follow real text).
+// BENCH_HEAT_OUT=file: rank 0's routes per MoE layer and local expert over the last run, a line per layer (bench_moe_prefill's BENCH_COUNTS).
 //   bench_prefill [tokens] [chunk ...]
 #include "engine/runtime/test_driver.h"
 #include "engine/loader/tokenizer.h"
@@ -42,11 +43,22 @@ int main( int argc, char** argv ) {
 		for ( int rep = 0; rep < 2; ++rep ) {
 			mc.reset_slot( 0 );
 			const bool last = ( ci + 1 == chunks.size() ) && rep == 1;
+			const char* heat_out = std::getenv( "BENCH_HEAT_OUT" );
+			std::vector<std::vector<uint32_t>> heat;
+			int heat_layers = 0, heat_experts = 0;
+			if ( heat_out && last ) mc.expert_heat( heat, heat_layers, heat_experts );   // reads and resets the counters
 			if ( prof && last ) CUDA_CHECK( cudaProfilerStart() );
 			const auto t0 = std::chrono::steady_clock::now();
 			mc.prefill( ids.data(), n, 0, chunks[ci] );
 			const double ms = test::ms_since( t0 );
 			if ( prof && last ) CUDA_CHECK( cudaProfilerStop() );
+			if ( heat_out && last && mc.expert_heat( heat, heat_layers, heat_experts ) ) {
+				std::ofstream o( heat_out );
+				for ( int l = 0; l < heat_layers; ++l ) {
+					for ( int e = 0; e < heat_experts; ++e ) o << heat[0][static_cast<size_t>( l ) * heat_experts + e] << ( e + 1 < heat_experts ? " " : "\n" );
+				}
+				std::printf( "  routes of %d layers x %d experts (rank 0) written to %s\n", heat_layers, heat_experts, heat_out );
+			}
 			if ( std::getenv( "BENCH_DECODE_AFTER" ) ) {  // one decode step (graph replay when warmed) after the prefill
 				int tok = 1000;
 				for ( int d = 0; d < std::atoi( std::getenv( "BENCH_DECODE_AFTER" ) ); ++d ) {

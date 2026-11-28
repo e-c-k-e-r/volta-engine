@@ -1,5 +1,8 @@
 // Routed-MoE prefill throughput on real GLM-5.3-Flash layer-3 experts (rank-0 partition, 72 of 288 experts):
-// rows routed uniformly over all 288 experts (BENCH_EXPERTS=N: over the first N), time per MoE::forward at several chunk sizes;
+// rows routed uniformly over all 288 experts (BENCH_EXPERTS=N: over the first N; BENCH_COUNTS=file:line: each expert as many routes as line
+// `line` of a bench_prefill BENCH_HEAT_OUT file gives it, a real prefill's routing, at the rows those routes make; a line of all 288 experts
+// without BENCH_SHARD gives rank BENCH_RANK's block of 72 whole experts its routes, the rest of every row's K going to other ranks' experts),
+// time per MoE::forward at several chunk sizes;
 // BENCH_RECON=1 also times one expert's three matrices through LinearTrellis::forward_recon (FP16 dequantization + cuBLAS) at those row counts.
 //   bench_moe_prefill [rows ...]
 #include "engine/runtime/test_paths.h"
@@ -11,7 +14,11 @@
 #include "engine/runtime/options.h"
 #include "engine/modules/swiglu.h"
 #include "trellis_context.h"
+#include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -75,6 +82,33 @@ int main( int argc, char** argv ) {
 	cudaEvent_t e0, e1;
 	CUDA_CHECK( cudaEventCreate( &e0 ) );
 	CUDA_CHECK( cudaEventCreate( &e1 ) );
+	// BENCH_COUNTS: a real window's routes per expert, dealt to rows heaviest first (every row K distinct experts)
+	std::vector<int> counts;
+	if ( const char* spec = std::getenv( "BENCH_COUNTS" ) ) {
+		std::string path = spec;
+		int line = 0;
+		if ( const size_t c = path.rfind( ':' ); c != std::string::npos ) {
+			line = std::atoi( path.c_str() + c + 1 );
+			path.resize( c );
+		}
+		std::ifstream f( path );
+		std::string text;
+		for ( int i = 0; i <= line && std::getline( f, text ); ++i ) {}
+		std::istringstream ls( text );
+		for ( int v; ls >> v; ) counts.push_back( v );
+		int total = 0;
+		for ( int v : counts ) total += v;
+		if ( static_cast<int>( counts.size() ) == 288 && E == 72 ) {
+			const int r = std::getenv( "BENCH_RANK" ) ? std::atoi( std::getenv( "BENCH_RANK" ) ) : 0;
+			counts = std::vector<int>( counts.begin() + 72 * r, counts.begin() + 72 * ( r + 1 ) );
+		}
+		ENGINE_ASSERT( static_cast<int>( counts.size() ) == E, "bench_moe_prefill: BENCH_COUNTS needs a line of one count per local expert, or of all 288" );
+		row_list = { total / K };
+		int mx = 0, active = 0;
+		for ( int v : counts ) { mx = std::max( mx, v ); active += v > 0; }
+		std::printf( "[*] routes from %s line %d: %d rows, %d active experts, the largest %d routes (mean %.1f)\n", path.c_str(), line, total / K, active, mx,
+			static_cast<double>( total ) / E );
+	}
 	for ( int R : row_list ) {
 		int rs[2] = { R, H };
 		auto xr = engine::core::arena_alloc_tensor( arena, pod::DType::FP16, rs, 2 );
@@ -90,7 +124,43 @@ int main( int argc, char** argv ) {
 		int local_routes = 0;
 		// BENCH_EXPERTS=N: rows routed over experts 0 .. N-1 only (N >= 8; 8 = every row to the same 8 experts, each `rows` rows: heavy experts)
 		static const int route_experts = std::getenv( "BENCH_EXPERTS" ) ? std::max( K, std::atoi( std::getenv( "BENCH_EXPERTS" ) ) ) : 288;
-		for ( int r = 0; r < R; ++r ) {
+		if ( !counts.empty() && E == 72 ) {
+			// whole experts: each local expert's routes on consecutive rows (cycling), the rest of a row's K on distinct other ranks' experts
+			std::vector<int> fill( R, 0 );
+			int at = 0;
+			for ( int e = 0; e < E; ++e ) {
+				for ( int c = 0; c < std::min( counts[e], R ); ++c ) {
+					int tries = 0;
+					while ( fill[at] >= K && tries++ < R ) at = ( at + 1 ) % R;
+					hi[at * K + fill[at]] = e;
+					hw[at * K + fill[at]] = __float2half( 0.125f );
+					++fill[at];
+					++local_routes;
+					at = ( at + 1 ) % R;
+				}
+			}
+			for ( int row = 0; row < R; ++row )
+				for ( int k = fill[row]; k < K; ++k ) {
+					hi[row * K + k] = E + k;   // another rank's expert, distinct within the row
+					hw[row * K + k] = __float2half( 0.125f );
+				}
+		}
+		else if ( !counts.empty() ) {
+			std::vector<int> left = counts;
+			for ( int r = 0; r < R; ++r ) {
+				std::vector<int> order( E );
+				for ( int e = 0; e < E; ++e ) order[e] = e;
+				std::partial_sort( order.begin(), order.begin() + K, order.end(), [&]( int a, int b ) { return left[a] > left[b]; } );
+				for ( int k = 0; k < K; ++k ) {
+					const int e = order[k];
+					hi[r * K + k] = e;
+					hw[r * K + k] = __float2half( 0.125f );
+					left[e] = std::max( 0, left[e] - 1 );
+					++local_routes;
+				}
+			}
+		}
+		for ( int r = 0; r < R && counts.empty(); ++r ) {
 			int used[288] = {};
 			for ( int k = 0; k < K; ++k ) {
 				int e;
