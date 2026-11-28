@@ -1,0 +1,182 @@
+[
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Explain how a refrigerator moves heat out of its inside, for someone without a physics background."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a short, friendly email to a neighbour asking them to water my plants for a week while I travel."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What are the main differences between a Roth IRA and a traditional IRA?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a 200-word story about a lighthouse keeper who finds a message in a bottle."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why does the moon always show the same face to the Earth?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Give me a three-day itinerary for a first visit to Kyoto."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Summarise the causes of the French Revolution in a few paragraphs."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "I keep procrastinating on a big project. What are some practical ways to get started?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Compare electric cars and hybrid cars for someone who drives 40 km a day."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a haiku sequence of four poems about the changing seasons in a city."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "How do vaccines train the immune system?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Draft a polite message declining a job offer after accepting another one."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the difference between weather and climate?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Suggest five vegetarian dinners that can be cooked in under thirty minutes, with a short description of each."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Explain what inflation is and why central banks raise interest rates to fight it."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a product description for a handmade ceramic coffee mug."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "How should I prepare for a job interview for a project manager position?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Why is the sky blue during the day and red at sunset?"
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a short speech for a best friend's wedding, warm and a little funny."
+   }
+  ]
+ },
+ {
+  "seg": "chat20",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What are the pros and cons of learning a second language as an adult?"
+   }
+  ]
+ }
+]

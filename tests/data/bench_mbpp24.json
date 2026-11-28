@@ -1,0 +1,218 @@
+[
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to find the top k integers that occur most frequently from given lists of sorted and distinct integers using heap queue algorithm.\n\nYour code should pass these tests:\nassert func([[1, 2, 6], [1, 3, 4, 5, 7, 8], [1, 3, 5, 6, 8, 9], [2, 5, 7, 11], [1, 4, 7, 8, 12]],3)==[5, 7, 1]\nassert func([[1, 2, 6], [1, 3, 4, 5, 7, 8], [1, 3, 5, 6, 8, 9], [2, 5, 7, 11], [1, 4, 7, 8, 12]],1)==[1]\nassert func([[1, 2, 6], [1, 3, 4, 5, 7, 8], [1, 3, 5, 6, 8, 9], [2, 5, 7, 11], [1, 4, 7, 8, 12]],5)==[6, 5, 7, 8, 1]\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to find the volume of a sphere.\n\nYour code should pass these tests:\nassert volume_sphere(10)==4188.790204786391\nassert volume_sphere(25)==65449.84694978735\nassert volume_sphere(20)==33510.32163829113\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to find n\u2019th smart number.\n\nYour code should pass these tests:\nassert smartNumber(1) == 30\nassert smartNumber(50) == 273\nassert smartNumber(1000) == 2664\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to find number of lists present in the given tuple.\n\nYour code should pass these tests:\nassert find_lists(([1, 2, 3, 4], [5, 6, 7, 8])) == 2\nassert find_lists(([1, 2], [3, 4], [5, 6]))  == 3\nassert find_lists(([9, 8, 7, 6, 5, 4, 3, 2, 1])) == 1\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to count the pairs with xor as an even number.\n\nYour code should pass these tests:\nassert find_even_Pair([5,4,7,2,1],5) == 4\nassert find_even_Pair([7,2,8,1,0,5,11],7) == 9\nassert find_even_Pair([1,2,3],3) == 1\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to convert octal number to decimal number.\n\nYour code should pass these tests:\nassert octal_To_Decimal(25) == 21\nassert octal_To_Decimal(30) == 24\nassert octal_To_Decimal(40) == 32\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to check the given decimal with a precision of 2 by using regex.\n\nYour code should pass these tests:\nassert is_decimal('123.11') == True\nassert is_decimal('0.21') == True\nassert is_decimal('123.1214') == False\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to find the minimum operations required to make two numbers equal.\n\nYour code should pass these tests:\nassert min_Operations(2,4) == 1\nassert min_Operations(4,10) == 4\nassert min_Operations(1,4) == 3\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to remove the characters which have odd index values of a given string.\n\nYour code should pass these tests:\nassert odd_values_string('abcdef') == 'ace'\nassert odd_values_string('python') == 'pto'\nassert odd_values_string('data') == 'dt'\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to choose specified number of colours from three different colours and generate all the combinations with repetitions.\n\nYour code should pass these tests:\nassert combinations_colors( [\"Red\",\"Green\",\"Blue\"],1)==[('Red',), ('Green',), ('Blue',)]\nassert combinations_colors( [\"Red\",\"Green\",\"Blue\"],2)==[('Red', 'Red'), ('Red', 'Green'), ('Red', 'Blue'), ('Green', 'Green'), ('Green', 'Blue'), ('Blue', 'Blue')]\nassert combinations_colors( [\"Red\",\"Green\",\"Blue\"],3)==[('Red', 'Red', 'Red'), ('Red', 'Red', 'Green'), ('Red', 'Red', 'Blue'), ('Red', 'Green', 'Green'), ('Red', 'Green', 'Blue'), ('Red', 'Blue', 'Blue'), ('Green', 'Green', 'Green'), ('Green', 'Green', 'Blue'), ('Green', 'Blue', 'Blue'), ('Blue', 'Blue', 'Blue')]\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to maximize the given two tuples.\n\nYour code should pass these tests:\nassert maximize_elements(((1, 3), (4, 5), (2, 9), (1, 10)), ((6, 7), (3, 9), (1, 1), (7, 3))) == ((6, 7), (4, 9), (2, 9), (7, 10))\nassert maximize_elements(((2, 4), (5, 6), (3, 10), (2, 11)), ((7, 8), (4, 10), (2, 2), (8, 4))) == ((7, 8), (5, 10), (3, 10), (8, 11))\nassert maximize_elements(((3, 5), (6, 7), (4, 11), (3, 12)), ((8, 9), (5, 11), (3, 3), (9, 5))) == ((8, 9), (6, 11), (4, 11), (9, 12))\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to find the ascii value of a character.\n\nYour code should pass these tests:\nassert ascii_value('A')==65\nassert ascii_value('R')==82\nassert ascii_value('S')==83\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to perfom the rear element extraction from list of tuples records.\n\nYour code should pass these tests:\nassert rear_extract([(1, 'Rash', 21), (2, 'Varsha', 20), (3, 'Kil', 19)]) == [21, 20, 19]\nassert rear_extract([(1, 'Sai', 36), (2, 'Ayesha', 25), (3, 'Salman', 45)]) == [36, 25, 45]\nassert rear_extract([(1, 'Sudeep', 14), (2, 'Vandana', 36), (3, 'Dawood', 56)]) == [14, 36, 56]\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to find the maximum of two numbers.\n\nYour code should pass these tests:\nassert maximum(5,10) == 10\nassert maximum(-1,-2) == -1\nassert maximum(9,7) == 9\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to perform the mathematical bitwise xor operation across the given tuples.\n\nYour code should pass these tests:\nassert bitwise_xor((10, 4, 6, 9), (5, 2, 3, 3)) == (15, 6, 5, 10)\nassert bitwise_xor((11, 5, 7, 10), (6, 3, 4, 4)) == (13, 6, 3, 14)\nassert bitwise_xor((12, 6, 8, 11), (7, 4, 5, 6)) == (11, 2, 13, 13)\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to remove odd numbers from a given list.\n\nYour code should pass these tests:\nassert remove_odd([1,2,3]) == [2]\nassert remove_odd([2,4,6]) == [2,4,6]\nassert remove_odd([10,20,3]) == [10,20]\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to find the last digit of a given number.\n\nYour code should pass these tests:\nassert last_Digit(123) == 3\nassert last_Digit(25) == 5\nassert last_Digit(30) == 0\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to find the largest negative number from the given list.\n\nYour code should pass these tests:\nassert largest_neg([1,2,3,-4,-6]) == -6\nassert largest_neg([1,2,3,-8,-9]) == -9\nassert largest_neg([1,2,3,4,-1]) == -1\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to find the peak element in the given array.\n\nYour code should pass these tests:\nassert find_peak([1, 3, 20, 4, 1, 0], 6) == 2\nassert find_peak([2, 3, 4, 5, 6], 5) == 4\nassert find_peak([8, 9, 11, 12, 14, 15], 6) == 5 \n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a python function to convert decimal number to octal number.\n\nYour code should pass these tests:\nassert decimal_to_Octal(10) == 12\nassert decimal_to_Octal(2) == 2\nassert decimal_to_Octal(33) == 41\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to sort counter by value.\n\nYour code should pass these tests:\nassert sort_counter({'Math':81, 'Physics':83, 'Chemistry':87})==[('Chemistry', 87), ('Physics', 83), ('Math', 81)]\nassert sort_counter({'Math':400, 'Physics':300, 'Chemistry':250})==[('Math', 400), ('Physics', 300), ('Chemistry', 250)]\nassert sort_counter({'Math':900, 'Physics':1000, 'Chemistry':1250})==[('Chemistry', 1250), ('Physics', 1000), ('Math', 900)]\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to determine if there is a subset of the given set with sum equal to the given sum.\n\nYour code should pass these tests:\nassert is_subset_sum([3, 34, 4, 12, 5, 2], 6, 9) == True\nassert is_subset_sum([3, 34, 4, 12, 5, 2], 6, 30) == False\nassert is_subset_sum([3, 34, 4, 12, 5, 2], 6, 15) == True\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to move all zeroes to the end of the given array.\n\nYour code should pass these tests:\nassert re_order([6, 0, 8, 2, 3, 0, 4, 0, 1]) == [6, 8, 2, 3, 4, 1, 0, 0, 0]\nassert re_order([4, 0, 2, 7, 0, 9, 0, 12, 0]) == [4, 2, 7, 9, 12, 0, 0, 0, 0]\nassert re_order([3, 11, 0, 74, 14, 0, 1, 0, 2]) == [3, 11, 74, 14, 1, 2, 0, 0, 0]\n\nWrite the Python function."
+   }
+  ]
+ },
+ {
+  "seg": "mbpp24",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Write a function to calculate the permutation coefficient of given p(n, k).\n\nYour code should pass these tests:\nassert permutation_coefficient(10, 2) == 90\nassert permutation_coefficient(10, 3) == 720\nassert permutation_coefficient(10, 1) == 10\n\nWrite the Python function."
+   }
+  ]
+ }
+]
