@@ -124,7 +124,7 @@ void bench_model( const char* type, const char* dir, int steps ) {
 
 int main( int argc, char** argv ) {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
-	// --model M (repeatable: an architecture or a checkpoint directory), --all: Qwen3.8-27B, GLM and Flash-Next; Qwen3.8-27B without either
+	// --model M (repeatable: an architecture or a checkpoint directory; Gemma 4 too), --all: Qwen3.8-27B, GLM and Flash-Next; Qwen3.8-27B without either
 	test::refuse_family_flags( argc, argv );
 	std::vector<test::TestModel> models;
 	for ( int i = 1; i < argc; ++i ) {
@@ -133,7 +133,7 @@ int main( int argc, char** argv ) {
 	}
 	if ( models.empty() ) models.push_back( test::resolve_model( "qwen3_5" ) );
 	for ( const test::TestModel& m : models ) {
-		ENGINE_ASSERT( m.is( "qwen3_5" ) || m.is( "glm5_next" ) || m.is( "qwen4_exp" ), "bench_decode: --model qwen3_5, glm5_next or qwen4_exp" );
+		ENGINE_ASSERT( m.is( "qwen3_5" ) || m.is( "glm5_next" ) || m.is( "qwen4_exp" ) || m.is( "gemma4" ), "bench_decode: --model qwen3_5, glm5_next, qwen4_exp or gemma4" );
 		impl::bench_model( m.type.c_str(), m.dir.c_str(), m.is( "glm5_next" ) ? 30 : 50 );
 	}
 	std::printf( "\n[+] Benchmark complete.\n" );

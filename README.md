@@ -53,18 +53,16 @@ The full list, with the docs for each part, is in [docs/README.md](/docs/README.
 
 ## Metrics
 
-Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 250 W, every expert on the GPUs (DeepSeek: 91% with its drafter), greedy, thinking off. Agent turns are replayed from a recorded Claude Code session (13-20K-token prompts); math and code are GSM8K and MBPP problems. Each model's best speculator for the kind of text:
+Decode speed of one request through the streaming API on 4x V100-SXM2-32GB at 250 W, every expert on the GPUs, greedy, thinking off. Agent turns are replayed from a recorded Claude Code session (11-20K-token prompts); math and code are GSM8K and MBPP problems. Each model's best speculator for the kind of text:
 
 | Model | Weights | Agent turns, tok/s | Math / code, tok/s |
 |---|---|---|---|
-| Qwen3.8-27B | NVFP4 | 154 (DFlash2) | 321 / 292 (DFlash2) |
-| Qwen3.8-27B | EXL3 4.0 bpw | 116 (MTP) | 186 / 167 (DFlash2) |
-| Qwen3.8-Flash-Next | NVFP4 | 165 (MTP) | 267 / 266 (MTP / DFlash2) |
-| Qwen3.8-Flash-Next | EXL3 4.0 bpw, Volta order | 133 (MTP) | 197 / 184 (DFlash2) |
-| GLM-5.3-Flash | EXL3 3.05 bpw, Volta order | 85 (MTP) | 149 / 141 (DFlash2) |
-| DeepSeek-V4.1-Flash | GGUF IQ1_M | | 89 / 89 (DSpark) |
+| Qwen3.8-27B | NVFP4 | 178 (DFlash2) | 337 / 312 (DFlash2) |
+| Qwen3.8-Flash-Next | NVFP4 | 220 (MTP) | 300 / 275 (DFlash2) |
+| GLM-5.3-Flash | EXL3 3.05 bpw, Volta order | 92 (DFlash2) | 137 / 135 (DFlash2) |
+| Gemma 4 31B | EXL3 4.0 bpw | 70 (DFlash) | 157 / 104 (DFlash) |
 
-Which speculator wins depends on the text: the checkpoint's MTP head on agent turns, which copy much of their input, and the DFlash2 drafter on math and code. Every configuration measured (GGUF, both EXL3 tile orders, each speculator and MTP depth), step latency, prefill and the method are in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md); perplexity per configuration and the EXL3 bit widths are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md).
+Which speculator wins depends on the text: the checkpoint's MTP head on agent turns, which copy much of their input, and the DFlash2 drafter on math and code. Step latency, prefill, the method, and an earlier session's configurations (EXL3 and GGUF builds of the Qwen models, both GLM tile orders, DeepSeek-V4.1-Flash, MTP depths) are in [docs/PERFORMANCE.md](/docs/PERFORMANCE.md); perplexity per configuration and the EXL3 bit widths are in [docs/QUANTIZATION.md](/docs/QUANTIZATION.md).
 
 A model's weight format largely decides its speed (NVFP4 decodes faster than EXL3 trellis at a similar size, and a smaller EXL3 quant faster than a bigger one), at the cost of perplexity.
 
