@@ -22,7 +22,21 @@ enum ggml_type {
 
 #define GGML_UNUSED( x ) (void) ( x )
 
-static __device__ __forceinline__ int ggml_cuda_dp4a( const int a, const int b, int c ) { return __dp4a( a, b, c ); }
+// Four signed bytes of a times four signed bytes of b, summed into c. ROCm's __dp4a (compat.h) is the unsigned form the codebook decode wants, so it
+// takes the signed dot of RDNA3 / RDNA4 (v_dot4_i32_iu8 with both operands signed), else byte by byte
+static __device__ __forceinline__ int ggml_cuda_dp4a( const int a, const int b, int c ) {
+#if defined( USE_ROCM )
+#if defined( __HIP_DEVICE_COMPILE__ ) && ( defined( __GFX11__ ) || defined( __GFX12__ ) )
+	return __builtin_amdgcn_sudot4( true, a, true, b, c, false );
+#else
+	#pragma unroll
+	for ( int i = 0; i < 4; ++i ) c += static_cast<int>( static_cast<int8_t>( ( a >> ( 8 * i ) ) & 0xff ) ) * static_cast<int>( static_cast<int8_t>( ( b >> ( 8 * i ) ) & 0xff ) );
+	return c;
+#endif
+#else
+	return __dp4a( a, b, c );
+#endif
+}
 
 static __device__ __forceinline__ float ggml_cuda_e8m0_to_fp32( uint8_t x ) {
 	uint32_t bits = x == 0 ? 0x00400000u : static_cast<uint32_t>( x ) << 23;

@@ -824,7 +824,7 @@ target_link_libraries(bench_nvfp4 PRIVATE engine_kernels)
 set_target_properties(bench_nvfp4 PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_gemm tests/3_bench/bench_gemm.cpp)
-target_link_libraries(bench_gemm PRIVATE engine_kernels cublas)
+target_link_libraries(bench_gemm PRIVATE engine_kernels)
 set_target_properties(bench_gemm PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 add_executable(bench_gguf_shapes tests/3_bench/bench_gguf_shapes.cpp)

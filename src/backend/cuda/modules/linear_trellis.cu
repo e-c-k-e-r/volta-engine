@@ -98,7 +98,8 @@ void LinearTrellis::forward(
 	const int wmma_max = std::min( EXL3_GEMM_ROCM_MAX_M, runtime::options().exl3_wmma_max_m );
 	const int gemv_max = std::max( 0, std::min( EXL3_GEMV_ROCM_MAX_M, runtime::options().exl3_gemv_max_m ) );
 	const bool wmma = m > gemv_max && m <= wmma_max && !c_fp32 && ( k % 128 == 0 ) && ( n % 128 == 0 ) && bits <= 8;
-	const bool recon = m > gemv_max && !wmma;
+	// the half-integer rates (width codes above 8) have no GEMV or GEMM instances: dequantize and run hipBLAS at any row count
+	const bool recon = ( m > gemv_max && !wmma ) || bits > 8;
 	gemm_shape = 0;
 #else
 	// The half-integer rates (width codes above 8) have no GEMM / GEMV instances: dequantize and run cuBLAS at any row count

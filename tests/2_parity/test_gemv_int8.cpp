@@ -200,7 +200,15 @@ void run_multi( int k_dim, std::initializer_list<int> widths, int K, pod::Memory
 	}
 	std::vector<pod::TensorView*> p1( T ), p2( T );
 	for ( int t = 0; t < T; ++t ) { p1[t] = &o_multi[t]; p2[t] = &o_multi2[t]; }
+#ifdef USE_ROCM
+	// the int8 GEMV needs more LDS than an RDNA workgroup has (docs/ROCM.md "Shared memory"): the multi-projection launch declines and the FP16 GEMV runs
+	if ( !engine::modules::trellis_forward_multi( x1s.data(), T, tr.data(), su.data(), sv.data(), p1.data(), K, false, true, stream, false ) ) {
+		std::printf( "  multi %d projections: declined on this device (LDS), skipped\n", T );
+		return;
+	}
+#else
 	ENGINE_ASSERT( engine::modules::trellis_forward_multi( x1s.data(), T, tr.data(), su.data(), sv.data(), p1.data(), K, false, true, stream, false ), "multi: declined at one row" );
+#endif
 	std::vector<std::vector<half>> first( T );
 	CUDA_CHECK( cudaStreamSynchronize( stream ) );
 	for ( int t = 0; t < T; ++t ) {

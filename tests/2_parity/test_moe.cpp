@@ -19,6 +19,13 @@
 #include <algorithm>
 #include <random>
 
+// the tile orders a build reads: both on SM_70 CUDA builds (ENGINE_EXL3_VL), else the stock one
+#if ENGINE_EXL3_VL
+static constexpr int kVoltaOrders = 2;
+#else
+static constexpr int kVoltaOrders = 1;
+#endif
+
 int main() {
 	setvbuf( stdout, nullptr, _IOLBF, 0 );
 	// MOE_FLASH=1: Flash-Next's experts (ENGINE_TEST_FLASH_DIR; MOE_BITS gives their bit width, 2 for Qwen3.8-Flash-Next-exl3) instead of GLM's
@@ -319,7 +326,7 @@ int main() {
 		CUDA_CHECK( cudaMemcpy( d_idx_r, hir.data(), hir.size() * sizeof( int ), cudaMemcpyHostToDevice ) );
 		CUDA_CHECK( cudaMemcpy( d_w_r, hwr.data(), hwr.size() * sizeof( half ), cudaMemcpyHostToDevice ) );
 		auto scratch_r = engine::modules::MoE::alloc_scratch( arena, E, K, H, I, R );
-		for ( int vt = ext_real ? static_cast<int>( mw.gate[0].volta_tiles ) : 0; vt < ( ext_real ? static_cast<int>( mw.gate[0].volta_tiles ) + 1 : ENGINE_EXL3_VL ? 2 : 1 ); ++vt ) {
+		for ( int vt = ext_real ? static_cast<int>( mw.gate[0].volta_tiles ) : 0; vt < ( ext_real ? static_cast<int>( mw.gate[0].volta_tiles ) + 1 : kVoltaOrders ); ++vt ) {
 			if ( !ext_real ) for ( int e = 0; e < E; ++e ) mw.gate[e].volta_tiles = mw.up[e].volta_tiles = mw.down[e].volta_tiles = vt == 1;
 			// the experts' dense weights, [k, n] row-major
 			auto dense = [&]( const pod::LinearWeight& lw ) {

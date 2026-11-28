@@ -841,10 +841,10 @@ void gemv_q8r_kernel( const uint8_t* __restrict__ w, const int8_t* __restrict__ 
 			for ( int j = 0; j < M; ++j ) {
 				{
 					const int4 a = reinterpret_cast<const int4*>( xq + static_cast<size_t>( j ) * k )[c];
-					int sum = __dp4a( wq.x, a.x, 0 );
-					sum = __dp4a( wq.y, a.y, sum );
-					sum = __dp4a( wq.z, a.z, sum );
-					sum = __dp4a( wq.w, a.w, sum );
+					int sum = ggml_cuda_dp4a( wq.x, a.x, 0 );
+					sum = ggml_cuda_dp4a( wq.y, a.y, sum );
+					sum = ggml_cuda_dp4a( wq.z, a.z, sum );
+					sum = ggml_cuda_dp4a( wq.w, a.w, sum );
 					acc[j] = fmaf( dw * xd[static_cast<size_t>( j ) * ( k / QK8_1 ) + c / 2], static_cast<float>( sum ), acc[j] );
 				}
 			}
@@ -936,10 +936,10 @@ void gemv_q8r_xs_kernel( const uint8_t* __restrict__ w, const int8_t* __restrict
 				const float da = sd[j * ( tile / QK8_1 ) + c / 2];
 				#pragma unroll
 				for ( int r = 0; r < R; ++r ) {
-					int sum = __dp4a( wq[r].x, a.x, 0 );
-					sum = __dp4a( wq[r].y, a.y, sum );
-					sum = __dp4a( wq[r].z, a.z, sum );
-					sum = __dp4a( wq[r].w, a.w, sum );
+					int sum = ggml_cuda_dp4a( wq[r].x, a.x, 0 );
+					sum = ggml_cuda_dp4a( wq[r].y, a.y, sum );
+					sum = ggml_cuda_dp4a( wq[r].z, a.z, sum );
+					sum = ggml_cuda_dp4a( wq[r].w, a.w, sum );
 					acc[r][j] = fmaf( dw[r] * da, static_cast<float>( sum ), acc[r][j] );
 				}
 			}
