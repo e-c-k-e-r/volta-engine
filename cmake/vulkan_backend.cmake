@@ -316,6 +316,22 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			DEPENDS ${GGML_VK_DEPS}
 			COMMENT "glslc ggml mul_mm quant (coopmat) -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
+		# the lookup-table (IQ) types on cooperative matrices: one SPIR-V per type (their grids are declared per type), the weight dequantized in shared memory as it loads
+		foreach(pair 16:iq2_xxs:8 17:iq2_xs:8 18:iq3_xxs:4 19:iq1_s:8 20:iq4_nl:4 21:iq3_s:4 22:iq2_s:8 23:iq4_xs:8 29:iq1_m:8)
+			string(REPLACE ":" ";" pl ${pair})
+			list(GET pl 0 id)
+			list(GET pl 1 tname)
+			list(GET pl 2 lva)
+			string(TOUPPER ${tname} TU)
+			set(sout ${SLANG_OUT}/ggml_mm_${id}_cm.spv)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.3 -O -DCOOPMAT=1 -DFLOAT16=1 -DACC_TYPE=float -DACC_TYPEV2=vec2 -DACC_TYPE_VEC4=vec4
+					-DFLOAT_TYPE=float16_t -DFLOAT_TYPEV2=f16vec2 -DFLOAT_TYPEV4=f16vec4 -DFLOAT_TYPEV8=f16mat2x4 -DDATA_A_${TU}=1 -DLOAD_VEC_A=${lva}
+					-DLOAD_VEC_B=8 -DB_TYPE=f16mat2x4 -DB_TYPE_SCALAR=float16_t -DB_TYPEV4=f16vec4 -DD_TYPE=float16_t ${GGML_VK_DIR}/mul_mm.comp -o ${sout}
+				DEPENDS ${GGML_VK_DEPS}
+				COMMENT "glslc ggml mul_mm ${tname} (coopmat) -> spirv")
+			list(APPEND VK_FLASH_SPV ${sout})
+		endforeach()
 		# the FP32 matmul (the TTS codec's convolutions): vec4 loads where ALIGNED, scalar ones with K bounds otherwise
 		set(sout ${SLANG_OUT}/ggml_mm_f32.spv)
 		add_custom_command(OUTPUT ${sout}
@@ -433,7 +449,10 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 	set_target_properties(test_gemma4_audio PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
 
 	# Op-level goldens through the module API (--check against the CUDA --dump)
-	foreach(t test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision)
+	add_executable(bench_vk_matmul tests/3_bench/bench_vk_matmul.cpp ${ENGINE_VK_OBJECTS})
+	target_link_libraries(bench_vk_matmul PRIVATE engine_backend_vulkan pthread)
+	set_target_properties(bench_vk_matmul PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_BINARY_DIR}")
+	foreach(t test_ops_linear test_ops_attention test_ops_moe test_ops_flash test_ops_vision test_vulkan_bigbuf)
 		add_executable(${t} tests/2_parity/${t}.cpp ${ENGINE_VK_OBJECTS})
 		target_link_libraries(${t} PRIVATE engine_backend_vulkan pthread)
 		add_dependencies(${t} slang_kernels)

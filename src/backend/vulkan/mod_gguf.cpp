@@ -550,10 +550,11 @@ bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int
 // runs ceil( k / k_split ) times as many workgroups (the shader's split index is the x group over the row blocks), each slab's partial in its own
 // llama.cpp's cooperative-matrix mul_mm (ggml_mm_1_cm.spv / ggml_mm_1_f32_cm.spv; 16 x 16 x 16 FP16 -> FP32 fragments) on a 32-wide subgroup:
 // {BLOCK_SIZE, BM, BN, BK (unused by FP16: 32), WM, WN, WMITER, TM, TN, TK, WARP, ALIGNED, SHMEM_STRIDE_PAD, APPLY_SLM_A_RESHAPE}. The 64 x 64 tile
-// fills the 7900 XTX's 48 CUs at prefill chunks of about a thousand rows; the 128 x 128 one reads each operand tile half as often and wins where the output
-// has 16M elements or more (swept on bench_tts_ops at 946 and 4096 rows; pad 4 beat 2 and 6)
+// fills the 7900 XTX's 48 CUs on narrow outputs and short chunks; the 128 x 128 one reads each operand tile half as often and wins on wide outputs
+// (bench_vk_matmul: 512 x 17408 x 5120 +43%, 512 x 5120 x 17408 +13%, while 512 x 1024 and 512 x 1536 lose a third for want of tiles). The pad of 4 beat 0
+// (40% slower) and 8 (4%); 2 and 6 are not multiples of 16 bytes of a row's stride
 constexpr uint32_t kCmTile[2][14] = { { 128, 64, 64, 16, 32, 32, 2, 16, 16, 16, 32, 1, 4, 0 }, { 128, 128, 128, 16, 64, 64, 2, 16, 16, 16, 32, 1, 4, 0 } };
-constexpr int64_t kCmLargeElems = int64_t( 16 ) << 20;
+constexpr int kCmLargeRows = 512, kCmLargeCols = 4096;
 backend::vk::Pipeline* coopmat_pipeline( bool f32_out, bool large ) {
 	static std::mutex mu;
 	static backend::vk::Pipeline* cache[64][2][2] = {};
@@ -579,21 +580,28 @@ backend::vk::Pipeline* coopmat_quant_pipeline( int type, bool large ) {
 	auto it = c.find( key );
 	if ( it != c.end() ) return it->second;
 	backend::vk::Pipeline* p = nullptr;
-	// the legacy and K-quant blocks (ggml's type ids 2 3 6 7 8, 10 to 14) and Q2_0 (42): the lookup-table types (IQ) need their grids in shared memory,
-	// which the vendored mul_mm.comp declares only for the per-type builds, so this shader would decode them wrongly
-	const bool supported = ( type >= 2 && type <= 3 ) || ( type >= 6 && type <= 8 ) || ( type >= 10 && type <= 14 ) || type == 42;
-	if ( supported && backend::vk::bound_pipelines() ) {
+	// the legacy and K-quant blocks (ggml's type ids 2 3 6 7 8, 10 to 14) and Q2_0 (42) run the runtime-typed shader (MULMAT_QUANT)
+	const bool runtime_typed = ( type >= 2 && type <= 3 ) || ( type >= 6 && type <= 8 ) || ( type >= 10 && type <= 14 ) || type == 42;
+	// the lookup-table types (IQ, ggml ids 16 to 23 and 29) have a build of their own
+	const bool per_type = ( type >= 16 && type <= 23 ) || type == 29;
+	if ( ( runtime_typed || per_type ) && backend::vk::bound_pipelines() ) {
 		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
-		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mm_quant_cm.spv";
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + ( per_type ? "/ggml_mm_" + std::to_string( type ) + "_cm.spv" : std::string( "/ggml_mm_quant_cm.spv" ) );
 		// the tile of the FP16 one with BK 32 (the quant types' block), then ALIGNED, MmTypeA, the shared-memory pad and the reshape flag
 		uint32_t spec[15];
 		for ( int i = 0; i < 11; ++i ) spec[i] = kCmTile[large ? 1 : 0][i];
 		spec[3] = 32;
 		spec[11] = 1;
-		spec[12] = static_cast<uint32_t>( type );
-		spec[13] = kCmTile[large ? 1 : 0][12];
-		spec[14] = kCmTile[large ? 1 : 0][13];
-		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( ::engine::modules::MmqParams ), 3, spec, 15 );
+		if ( per_type ) {   // no MmTypeA: the pad and the reshape flag follow ALIGNED
+			spec[12] = kCmTile[large ? 1 : 0][12];
+			spec[13] = kCmTile[large ? 1 : 0][13];
+		}
+		else {
+			spec[12] = static_cast<uint32_t>( type );
+			spec[13] = kCmTile[large ? 1 : 0][12];
+			spec[14] = kCmTile[large ? 1 : 0][13];
+		}
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( ::engine::modules::MmqParams ), 3, spec, per_type ? 14 : 15 );
 	}
 	c[key] = p;
 	return p;
@@ -603,7 +611,9 @@ bool coopmat_quant_matmul( const void* w, int type, const void* x, void* out, in
 	using namespace ::engine::modules;
 	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
 	if ( tensor_path() != TensorPath::Coopmat || k % 128 != 0 || !aligned( x ) || !aligned( out ) ) return false;
-	const bool large = static_cast<int64_t>( m ) * n >= kCmLargeElems;
+	// the quantized form dequantizes in shared memory: its 128 x 128 tile pays only from 16M output elements (E4B's prefill at 760 rows: 131 ms with the
+	// 64 x 64 tile, 234 with the large one on its 10240-wide projections)
+	const bool large = static_cast<int64_t>( m ) * n >= ( int64_t( 16 ) << 20 );
 	vk::Pipeline* mm = coopmat_quant_pipeline( type, large );
 	if ( mm == nullptr ) return false;
 	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
@@ -628,7 +638,7 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	// or not
 	const bool large = false;
 	vk::Pipeline* mm = nullptr;
-	const bool cm_large = static_cast<int64_t>( m ) * n >= kCmLargeElems;
+	const bool cm_large = m >= kCmLargeRows && n >= kCmLargeCols;
 	if ( tensor_path() == TensorPath::Coopmat ) mm = coopmat_pipeline( f32_out, cm_large );
 	const bool cm = mm != nullptr;
 	if ( cm ) {}

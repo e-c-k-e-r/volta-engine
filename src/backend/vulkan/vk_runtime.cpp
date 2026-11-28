@@ -34,6 +34,8 @@ struct Alloc {
 	VkBuffer buffer;
 	VkDeviceMemory memory;
 	uint64_t size;
+	bool sparse = false;    // a sparse buffer over several memory chunks (kSparseChunk each): one allocation is capped near 16 GiB on RADV
+	std::vector<VkDeviceMemory> chunks;
 	bool aliased = false;   // larger than a storage buffer range, on a driver that reads a descriptor into such a buffer wrongly: bound through windows (alias_window)
 };
 
@@ -67,6 +69,7 @@ struct Ctx {
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool budget = false;    // VK_EXT_memory_budget: the heaps' budget and usage (the driver's and other processes' allocations included)
+	bool sparse = false;    // sparseBinding enabled on a queue family that can bind (own devices only): arenas of kSparseFrom and more are sparse buffers
 	bool coopmat = false;   // VK_KHR_cooperative_matrix with a 16x16x16 FP16 x FP16 -> FP32 subgroup-scope shape, enabled with the Vulkan memory model
 	bool sg32 = false;      // VK_EXT_subgroup_size_control: pipelines created with a required subgroup size of 32 (the device's default is another)
 	// vulkan_profile: a timestamp before and after every dispatch (pairs in qpool, the pipeline of each in qwho), read at the next sync
@@ -469,6 +472,9 @@ bool init_context( int dev ) {
 	want2.features.shaderInt64 = VK_TRUE;
 	want2.features.shaderInt16 = f2.features.shaderInt16;
 	want2.features.shaderFloat64 = f2.features.shaderFloat64;
+	// sparse binding (the large arenas): own devices on a driver that has it
+	g.sparse = !sh.adopted && f2.features.sparseBinding == VK_TRUE;
+	want2.features.sparseBinding = g.sparse ? VK_TRUE : VK_FALSE;
 
 	uint32_t qn = 0;
 	vkGetPhysicalDeviceQueueFamilyProperties( g.phys, &qn, nullptr );
@@ -476,7 +482,7 @@ bool init_context( int dev ) {
 	vkGetPhysicalDeviceQueueFamilyProperties( g.phys, &qn, qf.data() );
 	bool found = false;
 	for ( uint32_t i = 0; i < qn && !found; ++i ) {
-		if ( qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) { g.family = i; found = true; }
+		if ( qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT ) { g.family = i; found = true; g.sparse = g.sparse && ( qf[i].queueFlags & VK_QUEUE_SPARSE_BINDING_BIT ); }
 	}
 	if ( sh.adopted ) {
 		found = sh.host.queue_family < qn && ( qf[sh.host.queue_family].queueFlags & VK_QUEUE_COMPUTE_BIT ) != 0;
@@ -555,7 +561,29 @@ uint32_t find_memory( uint32_t type_bits, VkMemoryPropertyFlags want ) {
 // memory: RADV reads a descriptor into a VkBuffer past maxBufferSize wrongly (device addresses and transfers into it are fine). NVIDIA's driver is
 // unaffected and keeps one dedicated buffer (large pages).
 constexpr uint64_t kAliasWindow = uint64_t( 256 ) << 20, kAliasBytes = uint64_t( 3 ) << 30;
+// One memory allocation is capped just under 16 GiB on RADV (VRAM free or not): from kSparseFrom an arena is a sparse buffer, its virtual range bound to
+// memory chunks of kSparseChunk, so the device addresses stay one contiguous range
+constexpr uint64_t kSparseFrom = uint64_t( 15 ) << 30, kSparseChunk = uint64_t( 4 ) << 30;
 bool needs_alias( size_t bytes ) { return bytes > cur().props.limits.maxStorageBufferRange && cur().props.vendorID != 0x10DE; }
+
+// Binds the memory ranges of one sparse buffer on the queue and waits for the bind
+bool bind_sparse( VkBuffer buf, const std::vector<VkSparseMemoryBind>& binds ) {
+	VkSparseBufferMemoryBindInfo sb{ buf, static_cast<uint32_t>( binds.size() ), binds.data() };
+	VkBindSparseInfo bi{ VK_STRUCTURE_TYPE_BIND_SPARSE_INFO };
+	bi.bufferBindCount = 1;
+	bi.pBufferBinds = &sb;
+	VkFenceCreateInfo fci{ VK_STRUCTURE_TYPE_FENCE_CREATE_INFO };
+	VkFence fence = VK_NULL_HANDLE;
+	if ( vkCreateFence( cur().device, &fci, nullptr, &fence ) != VK_SUCCESS ) return false;
+	VkResult r;
+	{
+		std::lock_guard<std::mutex> qlk( queue_mutex( cur() ) );
+		r = vkQueueBindSparse( cur().queue, 1, &bi, fence );
+	}
+	if ( r == VK_SUCCESS ) r = vkWaitForFences( cur().device, 1, &fence, VK_TRUE, UINT64_MAX );
+	vkDestroyFence( cur().device, fence, nullptr );
+	return r == VK_SUCCESS;
+}
 
 // Buffer + memory; device-local with BDA, or host-visible/coherent and mapped when host is true. False on failure
 bool create_buffer( size_t bytes, bool host, VkBuffer& buf, VkDeviceMemory& mem, void** map ) {
@@ -1115,6 +1143,49 @@ void* device_malloc_try( size_t bytes ) {
 	Alloc a{};
 	a.size = MAX( bytes, size_t( 4 ) );
 	a.aliased = needs_alias( bytes );
+	if ( cur().sparse && bytes >= kSparseFrom && cur().props.vendorID != 0x10DE ) {
+		a.sparse = true;
+		VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+		bci.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
+		bci.size = bytes;
+		bci.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+		if ( vkCreateBuffer( cur().device, &bci, nullptr, &a.buffer ) != VK_SUCCESS ) return nullptr;
+		VkMemoryRequirements req;
+		vkGetBufferMemoryRequirements( cur().device, a.buffer, &req );
+		const uint32_t type = find_memory( req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT );
+		bool ok = type != UINT32_MAX && kSparseChunk % req.alignment == 0;
+		std::vector<VkSparseMemoryBind> binds;
+		for ( uint64_t off = 0; ok && off < bytes; off += kSparseChunk ) {
+			const uint64_t len = std::min<uint64_t>( kSparseChunk, bytes - off );
+			VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+			flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+			VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, &flags };
+			mai.allocationSize = ( len + req.alignment - 1 ) / req.alignment * req.alignment;
+			mai.memoryTypeIndex = type;
+			VkDeviceMemory mem = VK_NULL_HANDLE;
+			if ( vkAllocateMemory( cur().device, &mai, nullptr, &mem ) != VK_SUCCESS ) { ok = false; break; }
+			a.chunks.push_back( mem );
+			VkSparseMemoryBind b{};
+			b.resourceOffset = off;
+			b.size = len;
+			b.memory = mem;
+			binds.push_back( b );
+		}
+		ok = ok && bind_sparse( a.buffer, binds );
+		if ( !ok ) {
+			for ( VkDeviceMemory m : a.chunks ) vkFreeMemory( cur().device, m, nullptr );
+			vkDestroyBuffer( cur().device, a.buffer, nullptr );
+			return nullptr;
+		}
+		a.size = bytes;
+		VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
+		ai.buffer = a.buffer;
+		const uint64_t addr = cur().get_address( cur().device, &ai );
+		std::lock_guard<std::mutex> lk( cur().mu );
+		cur().allocs[addr] = a;
+		cur().allocated += a.size;
+		return reinterpret_cast<void*>( addr );
+	}
 	if ( !create_buffer( bytes, false, a.buffer, a.memory, nullptr ) ) return nullptr;
 	VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
 	ai.buffer = a.buffer;
@@ -1147,7 +1218,8 @@ void device_free( void* p ) {
 		for ( auto it = cur().aliases.lower_bound( { addr, 0 } ); it != cur().aliases.end() && it->first.first == addr; it = cur().aliases.erase( it ) ) vkDestroyBuffer( cur().device, it->second, nullptr );
 	}
 	vkDestroyBuffer( cur().device, a.buffer, nullptr );
-	vkFreeMemory( cur().device, a.memory, nullptr );
+	if ( a.sparse ) for ( VkDeviceMemory m : a.chunks ) vkFreeMemory( cur().device, m, nullptr );
+	else vkFreeMemory( cur().device, a.memory, nullptr );
 }
 
 void graph_capture_begin( stream_t st ) {
@@ -1405,6 +1477,25 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 					bci.size = len;
 					bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 					VkBuffer wb = VK_NULL_HANDLE;
+					if ( al.sparse ) {
+						// a sparse window over the chunks it spans
+						bci.flags = VK_BUFFER_CREATE_SPARSE_BINDING_BIT;
+						std::vector<VkSparseMemoryBind> binds;
+						for ( uint64_t at = base; at < base + len; ) {
+							const uint64_t ci = at / kSparseChunk, chunk_end = ( ci + 1 ) * kSparseChunk;
+							const uint64_t upto = std::min<uint64_t>( chunk_end, base + len );
+							VkSparseMemoryBind b{};
+							b.resourceOffset = at - base;
+							b.size = upto - at;
+							b.memory = al.chunks[ci];
+							b.memoryOffset = at - ci * kSparseChunk;
+							binds.push_back( b );
+							at = upto;
+						}
+						ENGINE_ASSERT( vkCreateBuffer( cur().device, &bci, nullptr, &wb ) == VK_SUCCESS && bind_sparse( wb, binds ),
+							"Vulkan backend: a sparse window over a large allocation could not be created" );
+					}
+					else
 					ENGINE_ASSERT( vkCreateBuffer( cur().device, &bci, nullptr, &wb ) == VK_SUCCESS && vkBindBufferMemory( cur().device, wb, al.memory, base ) == VK_SUCCESS,
 						"Vulkan backend: a window over a large allocation could not be created" );
 					wit = cur().aliases.emplace( key, wb ).first;

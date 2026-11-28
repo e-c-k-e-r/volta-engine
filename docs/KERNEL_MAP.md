@@ -49,9 +49,10 @@ dequantize their weight in slices for it; `vk_cuda_launch` turns it off), held a
 and `test_ops_moe`.
 
 Where the device has `VK_KHR_cooperative_matrix` instead (RDNA3), `tensor_path()` is `Coopmat`: `ggml_f16_matmul` runs `mul_mm.comp` built with `-DCOOPMAT`
-(`ggml_mm_1_cm`, `ggml_mm_1_f32_cm`: 64 x 64 tiles, 128 x 128 from 16M output elements), and `LinearGguf` runs the same file's `MULMAT_QUANT` form
-(`ggml_mm_quant_cm`) for the legacy and K-quant types; `vk_coopmat` turns it off. Held against the ROCm build's goldens by `test_ops_linear`
-and `test_gguf_linear`.
+(`ggml_mm_1_cm`, `ggml_mm_1_f32_cm`: 64 x 64 tiles, 128 x 128 from 512 rows over outputs 4096 wide or more), and `LinearGguf` runs the same file's quantized form
+for every GGUF type: the `MULMAT_QUANT` build (`ggml_mm_quant_cm`) for the legacy and K-quant types, one build per lookup-table type
+(`ggml_mm_<id>_cm`); `vk_coopmat` turns it off. Held against the ROCm build's goldens by `test_ops_linear` and `test_gguf_linear`, and at every
+prefill row count and width by `test_vulkan_bigbuf`; timed by `bench_vk_matmul`.
 
 ## Module kernels: `src/backend/cuda/modules/`
 
