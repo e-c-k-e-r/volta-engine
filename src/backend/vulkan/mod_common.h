@@ -29,13 +29,18 @@ void* scratch( int slot, size_t bytes, stream_t stream );
 // matmul (k a multiple of 32), mod_gguf.cpp; false where neither applies (no bound pipelines, operands not 16-byte aligned, k not a multiple of 8)
 bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream );
 // The matmul alone, its output FP16 or (f32_out) FP32: false where it does not apply (k not a multiple of 32, operands not 16-byte aligned).
-// k_split > 0 (a multiple of 32): the K range in slabs of k_split, slab s's partial product into out + s * m * n (ceil( k / k_split ) of them)
-bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split = 0 );
+// k_split > 0 (a multiple of 32): the K range in slabs of k_split, slab s's partial product into out + s * m * n (ceil( k / k_split ) of them).
+// ldc > 0: out's row stride (a slice of a wider output; not with k_split)
+bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split = 0, int ldc = 0 );
+// out [m, n] FP16 = x [m, k] times the GGUF weight w (n rows of k, block type `type` as ggml numbers it) on cooperative matrices, the weight dequantized in
+// shared memory as the tiles load (llama.cpp's mul_mm with MULMAT_QUANT). False where it does not apply (not the Coopmat path, k not a multiple of 128,
+// operands not 16-byte aligned, no pipeline for the type)
+bool coopmat_quant_matmul( const void* w, int type, const void* x, void* out, int m, int n, int k, stream_t stream );
 // The FP16-out matmul, split over K (FP32 partials summed in order, scratch slot 3) when few output tiles would run over a long K
 bool ggml_f16_matmul_split( const void* w, const void* x, void* out, int m, int n, int k, stream_t stream );
 // The tensor-core path of the current device: CudaLaunch where VK_NV_cuda_kernel_launch is enabled (NVIDIA; Volta's only one, it has no
-// cooperative matrices), else None (the shader-core kernels). A cooperative-matrix path would be another value here
-enum class TensorPath { None, CudaLaunch };
+// cooperative matrices), else Coopmat where VK_KHR_cooperative_matrix gives a 16 x 16 x 16 FP16 shape (RDNA3), else None (the shader-core kernels)
+enum class TensorPath { None, CudaLaunch, Coopmat };
 TensorPath tensor_path();
 // out [m, n] = x [m, k] times the FP16 weights w [n, k] on the CUDA backend's tensor-core GEMM (mod_cuda.cpp), FP16 or (f32_out) FP32 out.
 // k_split > 0: the K range in slabs of k_split, slab s's FP32 partial into out + s * m * n; else split as the GEMM's model decides, the partials

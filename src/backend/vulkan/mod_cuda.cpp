@@ -17,7 +17,8 @@
 namespace engine::backend::impl {
 
 TensorPath tensor_path() {
-	return vk::cuda_launch_available() ? TensorPath::CudaLaunch : TensorPath::None;
+	if ( vk::cuda_launch_available() ) return TensorPath::CudaLaunch;
+	return vk::coopmat() ? TensorPath::Coopmat : TensorPath::None;
 }
 
 namespace {

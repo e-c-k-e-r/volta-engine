@@ -48,6 +48,11 @@ from its command buffers for every FP16 matmul (`src/backend/vulkan/mod_cuda.cpp
 dequantize their weight in slices for it; `vk_cuda_launch` turns it off), held against the CUDA goldens by `test_ops_linear`, `test_ops_flash`
 and `test_ops_moe`.
 
+Where the device has `VK_KHR_cooperative_matrix` instead (RDNA3), `tensor_path()` is `Coopmat`: `ggml_f16_matmul` runs `mul_mm.comp` built with `-DCOOPMAT`
+(`ggml_mm_1_cm`, `ggml_mm_1_f32_cm`: 64 x 64 tiles, 128 x 128 from 16M output elements), and `LinearGguf` runs the same file's `MULMAT_QUANT` form
+(`ggml_mm_quant_cm`) for the legacy and K-quant types; `vk_coopmat` turns it off. Held against the ROCm build's goldens by `test_ops_linear`
+and `test_gguf_linear`.
+
 ## Module kernels: `src/backend/cuda/modules/`
 
 | File | Kernels | Verified by |

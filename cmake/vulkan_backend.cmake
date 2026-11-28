@@ -292,6 +292,30 @@ if(ENGINE_BACKEND STREQUAL "VULKAN")
 			DEPENDS ${GGML_VK_DEPS}
 			COMMENT "glslc ggml mul_mm f16 -> f32 -> spirv")
 		list(APPEND VK_FLASH_SPV ${sout})
+		# the same two FP16 matmuls on cooperative matrices (VK_KHR_cooperative_matrix, 16 x 16 x 16 FP16 -> FP32; mod_gguf.cpp picks them where tensor_path is Coopmat)
+		foreach(variant ggml_mm_1_cm:float16_t ggml_mm_1_f32_cm:float)
+			string(REPLACE ":" ";" vl ${variant})
+			list(GET vl 0 vname)
+			list(GET vl 1 dtype)
+			set(sout ${SLANG_OUT}/${vname}.spv)
+			add_custom_command(OUTPUT ${sout}
+				COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.3 -O -DCOOPMAT=1 -DFLOAT16=1 -DACC_TYPE=float -DACC_TYPEV2=vec2 -DACC_TYPE_VEC4=vec4
+					-DFLOAT_TYPE=float16_t -DFLOAT_TYPEV2=f16vec2 -DFLOAT_TYPEV4=f16vec4 -DFLOAT_TYPEV8=f16mat2x4 -DDATA_A_F16=1 -DLOAD_VEC_A=8
+					-DLOAD_VEC_B=8 -DB_TYPE=f16mat2x4 -DB_TYPE_SCALAR=float16_t -DB_TYPEV4=f16vec4 -DD_TYPE=${dtype} ${GGML_VK_DIR}/mul_mm.comp -o ${sout}
+				DEPENDS ${GGML_VK_DEPS}
+				COMMENT "glslc ggml ${vname} (coopmat) -> spirv")
+			list(APPEND VK_FLASH_SPV ${sout})
+		endforeach()
+		# the matmul with the weight dequantized in shared memory as it loads, on cooperative matrices: one SPIR-V for every GGUF type (MULMAT_QUANT, the type a
+		# specialization constant), FP16 output (mod_gguf.cpp picks it where tensor_path is Coopmat)
+		set(sout ${SLANG_OUT}/ggml_mm_quant_cm.spv)
+		add_custom_command(OUTPUT ${sout}
+			COMMAND ${GLSLC} -fshader-stage=compute --target-env=vulkan1.3 -O -DCOOPMAT=1 -DMULMAT_QUANT=1 -DFLOAT16=1 -DACC_TYPE=float -DACC_TYPEV2=vec2
+				-DACC_TYPE_VEC4=vec4 -DFLOAT_TYPE=float16_t -DFLOAT_TYPEV2=f16vec2 -DFLOAT_TYPEV4=f16vec4 -DFLOAT_TYPEV8=f16mat2x4 -DLOAD_VEC_B=8
+				-DB_TYPE=f16mat2x4 -DB_TYPE_SCALAR=float16_t -DB_TYPEV4=f16vec4 -DD_TYPE=float16_t ${GGML_VK_DIR}/mul_mm.comp -o ${sout}
+			DEPENDS ${GGML_VK_DEPS}
+			COMMENT "glslc ggml mul_mm quant (coopmat) -> spirv")
+		list(APPEND VK_FLASH_SPV ${sout})
 		# the FP32 matmul (the TTS codec's convolutions): vec4 loads where ALIGNED, scalar ones with K bounds otherwise
 		set(sout ${SLANG_OUT}/ggml_mm_f32.spv)
 		add_custom_command(OUTPUT ${sout}

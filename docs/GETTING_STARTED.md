@@ -73,6 +73,12 @@ They run the portable parts on reference kernels (GGUF projections on llama.cpp'
   build runs its FP16 matmuls (GGUF prefill chunks among them, the weight dequantized in slices), its NVFP4 linears and its attention
   (prefill chunks, and decode rows on quantized caches) on tensor-core CUDA kernels, built as PTX where nvcc is found at configure time (the driver loads it; no CUDA library is linked);
   `--set vk_cuda_launch=false` keeps them on the shader cores
+* on a device with cooperative matrices and no CUDA launches (RDNA3: `VK_KHR_cooperative_matrix`, a 16 x 16 x 16 FP16 shape), the FP16 matmuls (dense FP16,
+  NVFP4 and trellis dequantize-then-matmul) run llama.cpp's cooperative-matrix `mul_mm`, and GGUF prefill chunks of the legacy and K-quant types run its
+  quantized form (the weight dequantized in shared memory as the tiles load); the lookup-table (IQ) types keep the int8 and shader matmuls.
+  `--set vk_coopmat=false` keeps all of it on the shader cores
+* the arena of a device is one buffer: on drivers that read a descriptor wrongly into a buffer past 4 GiB (RADV) the bound-buffer shaders get windows of at
+  most 3 GiB over its memory
 * the routed experts are all resident (no expert tier); the MTP head runs on both (`test_mtp` passes the 27B GGUF on CPU and Vulkan)
 * DeepSeek-V4.1, the DFlash / DFlash2 / DSpark drafters and MiniMax-H3 are CUDA only (the ROCm build compiles MiniMax-H3 but does not run it,
   see [ROCM.md](ROCM.md#not-supported-on-rocm))

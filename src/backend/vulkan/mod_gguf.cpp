@@ -334,6 +334,17 @@ void LinearGguf::forward( const pod::TensorView& x, const void* w, GgmlType type
 	}
 	// more than 16 rows: llama.cpp's matmuls, the large tiles from 128 rows
 	const bool large = false;   // the 64 x 64 tiles, as ggml_f16_matmul's (the 128 x 128 ones measured slower on the V100 at prefill chunks too)
+	if ( m > kDotMaxRows && vki::tensor_path() == vki::TensorPath::Coopmat && k % 128 == 0 ) {
+		// cooperative matrices: the weight dequantized in shared memory as the tiles load (no FP16 copy of it), column-tiled activations permuted first
+		const void* xs = x.data;
+		if ( tiling.heads != 0 ) {
+			void* xp = vki::scratch( 19, static_cast<size_t>( m ) * k * sizeof( backend::half_t ), stream );
+			GgufPermuteParams q{ vki::dp( x.data ), vki::dp( xp ), m, k, tiling.heads, tiling.dim };
+			vki::launch( "gguf_permute_rows", q, stream, static_cast<uint32_t>( ( k + 255 ) / 256 ), static_cast<uint32_t>( m ) );
+			xs = xp;
+		}
+		if ( vki::coopmat_quant_matmul( w, static_cast<int>( type ), xs, out.data, m, n, k, stream ) ) return;
+	}
 	backend::vk::Pipeline* mmq = m > kDotMaxRows && k % 128 == 0 ? mmq_pipeline( type, large ) : nullptr;
 	if ( mmq != nullptr ) {
 		// the rows as q8_1 x4 blocks (36 words per 128 values), then the matmul in BM x BN tiles of output rows x activation rows
@@ -537,13 +548,78 @@ bool ggml_f16_linear( const void* w, const void* x, void* out, int m, int n, int
 // The matmul alone (FP16 or FP32 output): ALIGNED drops the K bound checks, so k (and k_split) a multiple of the tiles' BK of 32 (the CUDA
 // GEMM, where it runs, takes multiples of 8). A split K
 // runs ceil( k / k_split ) times as many workgroups (the shader's split index is the x group over the row blocks), each slab's partial in its own
+// llama.cpp's cooperative-matrix mul_mm (ggml_mm_1_cm.spv / ggml_mm_1_f32_cm.spv; 16 x 16 x 16 FP16 -> FP32 fragments) on a 32-wide subgroup:
+// {BLOCK_SIZE, BM, BN, BK (unused by FP16: 32), WM, WN, WMITER, TM, TN, TK, WARP, ALIGNED, SHMEM_STRIDE_PAD, APPLY_SLM_A_RESHAPE}. The 64 x 64 tile
+// fills the 7900 XTX's 48 CUs at prefill chunks of about a thousand rows; the 128 x 128 one reads each operand tile half as often and wins where the output
+// has 16M elements or more (swept on bench_tts_ops at 946 and 4096 rows; pad 4 beat 2 and 6)
+constexpr uint32_t kCmTile[2][14] = { { 128, 64, 64, 16, 32, 32, 2, 16, 16, 16, 32, 1, 4, 0 }, { 128, 128, 128, 16, 64, 64, 2, 16, 16, 16, 32, 1, 4, 0 } };
+constexpr int64_t kCmLargeElems = int64_t( 16 ) << 20;
+backend::vk::Pipeline* coopmat_pipeline( bool f32_out, bool large ) {
+	static std::mutex mu;
+	static backend::vk::Pipeline* cache[64][2][2] = {};
+	static bool tried[64][2][2] = {};
+	std::lock_guard<std::mutex> lk( mu );
+	const int dev = backend::get_device();
+	const int f = f32_out ? 1 : 0, l = large ? 1 : 0;
+	if ( !tried[dev][f][l] && backend::vk::bound_pipelines() ) {
+		tried[dev][f][l] = true;
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + ( f32_out ? "/ggml_mm_1_f32_cm.spv" : "/ggml_mm_1_cm.spv" );
+		cache[dev][f][l] = backend::vk::pipeline_create_bound( path.c_str(), sizeof( ::engine::modules::MmqParams ), 3, kCmTile[l], 14 );
+	}
+	return cache[dev][f][l];
+}
+
+backend::vk::Pipeline* coopmat_quant_pipeline( int type, bool large ) {
+	static std::mutex mu;
+	static std::map<std::pair<int, int>, backend::vk::Pipeline*> cache[64];
+	std::lock_guard<std::mutex> lk( mu );
+	auto& c = cache[backend::get_device()];
+	const auto key = std::make_pair( type, large ? 1 : 0 );
+	auto it = c.find( key );
+	if ( it != c.end() ) return it->second;
+	backend::vk::Pipeline* p = nullptr;
+	// the legacy and K-quant blocks (ggml's type ids 2 3 6 7 8, 10 to 14) and Q2_0 (42): the lookup-table types (IQ) need their grids in shared memory,
+	// which the vendored mul_mm.comp declares only for the per-type builds, so this shader would decode them wrongly
+	const bool supported = ( type >= 2 && type <= 3 ) || ( type >= 6 && type <= 8 ) || ( type >= 10 && type <= 14 ) || type == 42;
+	if ( supported && backend::vk::bound_pipelines() ) {
+		const char* dir = std::getenv( "ENGINE_SPV_DIR" );
+		const std::string path = std::string( dir ? dir : SLANG_SPV_DIR ) + "/ggml_mm_quant_cm.spv";
+		// the tile of the FP16 one with BK 32 (the quant types' block), then ALIGNED, MmTypeA, the shared-memory pad and the reshape flag
+		uint32_t spec[15];
+		for ( int i = 0; i < 11; ++i ) spec[i] = kCmTile[large ? 1 : 0][i];
+		spec[3] = 32;
+		spec[11] = 1;
+		spec[12] = static_cast<uint32_t>( type );
+		spec[13] = kCmTile[large ? 1 : 0][12];
+		spec[14] = kCmTile[large ? 1 : 0][13];
+		p = backend::vk::pipeline_create_bound( path.c_str(), sizeof( ::engine::modules::MmqParams ), 3, spec, 15 );
+	}
+	c[key] = p;
+	return p;
+}
+
+bool coopmat_quant_matmul( const void* w, int type, const void* x, void* out, int m, int n, int k, stream_t stream ) {
+	using namespace ::engine::modules;
+	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
+	if ( tensor_path() != TensorPath::Coopmat || k % 128 != 0 || !aligned( x ) || !aligned( out ) ) return false;
+	const bool large = static_cast<int64_t>( m ) * n >= kCmLargeElems;
+	vk::Pipeline* mm = coopmat_quant_pipeline( type, large );
+	if ( mm == nullptr ) return false;
+	const uint32_t uk = static_cast<uint32_t>( k ), un = static_cast<uint32_t>( n ), um = static_cast<uint32_t>( m );
+	MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, uk, 1u, 1u, 1u, 1u };
+	const void* bufs[3] = { w, x, out };
+	vk::dispatch_bound( stream, mm, &mp, bufs, ( un + kCmTile[large ? 1 : 0][1] - 1 ) / kCmTile[large ? 1 : 0][1], ( um + kCmTile[large ? 1 : 0][2] - 1 ) / kCmTile[large ? 1 : 0][2], 1 );
+	return true;
+}
+
 // m x n of out
-bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split ) {
+bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int k, bool f32_out, stream_t stream, int k_split, int ldc ) {
 	using namespace ::engine::modules;
 	auto aligned = []( const void* p ) { return reinterpret_cast<uintptr_t>( p ) % 16 == 0; };
 	if ( !aligned( w ) || !aligned( x ) || !aligned( out ) ) return false;
 	// the tensor cores where the device has a path to them (the same output and slab layout; K a multiple of 8)
-	if ( k_split % 8 == 0 && cuda_gemm_tn( w, x, out, m, n, k, f32_out, k_split > 0 && k_split < k ? k_split : 0, stream ) ) return true;
+	if ( k_split % 8 == 0 && cuda_gemm_tn( w, x, out, m, n, k, f32_out, k_split > 0 && k_split < k ? k_split : 0, stream, ldc ) ) return true;
 	if ( k % 32 != 0 || k_split % 32 != 0 ) return false;
 	if ( k_split <= 0 || k_split > k ) k_split = k;
 	const uint32_t splits = static_cast<uint32_t>( ( k + k_split - 1 ) / k_split );
@@ -552,7 +628,11 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	// or not
 	const bool large = false;
 	vk::Pipeline* mm = nullptr;
-	if ( f32_out ) {
+	const bool cm_large = static_cast<int64_t>( m ) * n >= kCmLargeElems;
+	if ( tensor_path() == TensorPath::Coopmat ) mm = coopmat_pipeline( f32_out, cm_large );
+	const bool cm = mm != nullptr;
+	if ( cm ) {}
+	else if ( f32_out ) {
 		static std::mutex mu;
 		static vk::Pipeline* cache[64][2] = {};
 		static bool tried[64][2] = {};
@@ -572,9 +652,10 @@ bool ggml_f16_matmul( const void* w, const void* x, void* out, int m, int n, int
 	}
 	else mm = mm_pipeline( GgmlType::F16, large );
 	if ( mm == nullptr ) return false;
-	MmqParams mp{ un, um, uk, uk, uk, un, un * uk, um * uk, um * un, 0u, 1u, static_cast<uint32_t>( k_split ), 1u, 1u, 1u, 1u };
+	MmqParams mp{ un, um, uk, uk, uk, ldc > 0 ? static_cast<uint32_t>( ldc ) : un, un * uk, um * uk, um * un, 0u, 1u, static_cast<uint32_t>( k_split ), 1u, 1u, 1u, 1u };
 	const void* bufs[3] = { w, x, out };
-	const MmqTile tile = mmq_tile( GgmlType::F16, large );
+	MmqTile tile = mmq_tile( GgmlType::F16, large );
+	if ( cm ) { tile.spec[1] = kCmTile[cm_large][1]; tile.spec[2] = kCmTile[cm_large][2]; }
 	vk::dispatch_bound( stream, mm, &mp, bufs, ( ( un + tile.spec[1] - 1 ) / tile.spec[1] ) * splits, ( um + tile.spec[2] - 1 ) / tile.spec[2], 1 );
 	return true;
 }

@@ -34,6 +34,7 @@ struct Alloc {
 	VkBuffer buffer;
 	VkDeviceMemory memory;
 	uint64_t size;
+	bool aliased = false;   // larger than a storage buffer range, on a driver that reads a descriptor into such a buffer wrongly: bound through windows (alias_window)
 };
 
 struct Staging {
@@ -66,6 +67,7 @@ struct Ctx {
 	size_t host_import_align = 0;   // VK_KHR_push_descriptor: storage buffers bound inside the command buffer
 	bool int_dot = false;   // shaderIntegerDotProduct (VK_KHR_shader_integer_dot_product) enabled: packed 4 x int8 dot products
 	bool budget = false;    // VK_EXT_memory_budget: the heaps' budget and usage (the driver's and other processes' allocations included)
+	bool coopmat = false;   // VK_KHR_cooperative_matrix with a 16x16x16 FP16 x FP16 -> FP32 subgroup-scope shape, enabled with the Vulkan memory model
 	bool sg32 = false;      // VK_EXT_subgroup_size_control: pipelines created with a required subgroup size of 32 (the device's default is another)
 	// vulkan_profile: a timestamp before and after every dispatch (pairs in qpool, the pipeline of each in qwho), read at the next sync
 	VkQueryPool qpool = VK_NULL_HANDLE;
@@ -85,6 +87,7 @@ struct Ctx {
 	// under mu; every stream records into command buffers of its own pool, so threads on different streams never share a pool
 	std::mutex mu;
 	std::map<uint64_t, Alloc> allocs; // keyed by device address
+	std::map<std::pair<uint64_t, uint64_t>, VkBuffer> aliases;   // (allocation address, window base) -> a buffer over that window of the allocation's memory
 	std::multimap<size_t, Staging> staging_pool;   // idle pooled staging buffers by capacity
 	size_t staging_pool_bytes = 0;
 	uint64_t allocated = 0;           // bytes in allocs
@@ -322,7 +325,7 @@ bool init_context( int dev ) {
 
 	// Feature requirements of the Slang SPIR-V: PhysicalStorageBufferAddresses, Float16, Int64 (+ Int16 for the BF16 table)
 	bool has_dot_ext = false, has_push_desc = false, has_host_import = false, has_sem_fd = false, has_mem_fd = false, has_budget = false, has_sg_ctl = false;
-	bool has_cuda = false, has_sm_builtins = false;
+	bool has_cuda = false, has_sm_builtins = false, has_coopmat = false;
 	{
 		uint32_t en = 0;
 		vkEnumerateDeviceExtensionProperties( g.phys, nullptr, &en, nullptr );
@@ -337,6 +340,7 @@ bool init_context( int dev ) {
 			has_budget = has_budget || std::strcmp( e.extensionName, VK_EXT_MEMORY_BUDGET_EXTENSION_NAME ) == 0;
 			has_sg_ctl = has_sg_ctl || std::strcmp( e.extensionName, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME ) == 0;
 			has_cuda = has_cuda || std::strcmp( e.extensionName, VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME ) == 0;
+			has_coopmat = has_coopmat || std::strcmp( e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME ) == 0;
 			has_sm_builtins = has_sm_builtins || std::strcmp( e.extensionName, VK_NV_SHADER_SM_BUILTINS_EXTENSION_NAME ) == 0;
 		}
 	}
@@ -375,6 +379,8 @@ bool init_context( int dev ) {
 	if ( has_sg_ctl ) { fsg.pNext = query_chain; query_chain = &fsg; }
 	if ( has_dot_ext ) { fdot.pNext = query_chain; query_chain = &fdot; }
 	if ( has_cuda ) { fcuda.pNext = query_chain; query_chain = &fcuda; }
+	VkPhysicalDeviceCooperativeMatrixFeaturesKHR fcm{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+	if ( has_coopmat && !sh.adopted ) { fcm.pNext = query_chain; query_chain = &fcm; }
 	VkPhysicalDeviceVulkan11Features f11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, query_chain };
 	VkPhysicalDeviceVulkan12Features f12{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES, &f11 };
 	VkPhysicalDeviceFeatures2 f2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &f12 };
@@ -409,6 +415,23 @@ bool init_context( int dev ) {
 
 	g.int_dot = has_dot_ext && fdot.shaderIntegerDotProduct == VK_TRUE;
 	g.cuda = has_cuda && fcuda.cudaKernelLaunchFeatures == VK_TRUE;
+	// cooperative matrices: the shaders (glslc's coopmat variants of llama.cpp's mul_mm) need the feature, the Vulkan memory model and a 16 x 16 x 16
+	// FP16 x FP16 -> FP32 shape at subgroup scope. A device the host created keeps to the shader cores (its features are the host's).
+	// vk_coopmat=false turns the path off.
+	if ( has_coopmat && !sh.adopted && fcm.cooperativeMatrix == VK_TRUE && f12.vulkanMemoryModel == VK_TRUE &&
+		( engine::runtime::options == nullptr || engine::runtime::options().vk_coopmat ) ) {
+		auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>( vkGetInstanceProcAddr( sh.instance, "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR" ) );
+		if ( get_props != nullptr ) {
+			uint32_t cn = 0;
+			get_props( g.phys, &cn, nullptr );
+			std::vector<VkCooperativeMatrixPropertiesKHR> cp( cn, VkCooperativeMatrixPropertiesKHR{ VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_KHR } );
+			get_props( g.phys, &cn, cp.data() );
+			for ( const auto& c : cp ) {
+				if ( c.MSize == 16 && c.NSize == 16 && c.KSize == 16 && c.AType == VK_COMPONENT_TYPE_FLOAT16_KHR && c.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+					c.CType == VK_COMPONENT_TYPE_FLOAT32_KHR && c.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR && c.scope == VK_SCOPE_SUBGROUP_KHR ) g.coopmat = true;
+			}
+		}
+	}
 	if ( sg.subgroupSize != 32 ) {
 		g.sg32 = has_sg_ctl && fsg.subgroupSizeControl == VK_TRUE && sgp.minSubgroupSize <= 32 && sgp.maxSubgroupSize >= 32 &&
 			( sgp.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT ) != 0;
@@ -422,12 +445,15 @@ bool init_context( int dev ) {
 	want_sg.subgroupSizeControl = VK_TRUE;
 	VkPhysicalDeviceShaderIntegerDotProductFeaturesKHR want_dot{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR };
 	want_dot.shaderIntegerDotProduct = VK_TRUE;
+	VkPhysicalDeviceCooperativeMatrixFeaturesKHR want_cm{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR };
+	want_cm.cooperativeMatrix = VK_TRUE;
 	VkPhysicalDeviceCudaKernelLaunchFeaturesNV want_cuda{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV };
 	want_cuda.cudaKernelLaunchFeatures = VK_TRUE;
 	void* want_chain = nullptr;
 	if ( g.sg32 ) { want_sg.pNext = want_chain; want_chain = &want_sg; }
 	if ( g.int_dot ) { want_dot.pNext = want_chain; want_chain = &want_dot; }
 	if ( g.cuda ) { want_cuda.pNext = want_chain; want_chain = &want_cuda; }
+	if ( g.coopmat ) { want_cm.pNext = want_chain; want_chain = &want_cm; }
 	VkPhysicalDeviceVulkan11Features want11{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES, want_chain };
 	want11.storageBuffer16BitAccess = f11.storageBuffer16BitAccess;
 	want11.uniformAndStorageBuffer16BitAccess = f11.uniformAndStorageBuffer16BitAccess;
@@ -435,6 +461,8 @@ bool init_context( int dev ) {
 	want12.bufferDeviceAddress = VK_TRUE;
 	want12.shaderFloat16 = VK_TRUE;
 	want12.timelineSemaphore = VK_TRUE;
+	want12.vulkanMemoryModel = g.coopmat ? VK_TRUE : VK_FALSE;
+	want12.vulkanMemoryModelDeviceScope = g.coopmat ? f12.vulkanMemoryModelDeviceScope : VK_FALSE;
 	want12.shaderInt8 = f12.shaderInt8;
 	want12.storageBuffer8BitAccess = f12.storageBuffer8BitAccess;
 	VkPhysicalDeviceFeatures2 want2{ VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &want12 };
@@ -473,6 +501,7 @@ bool init_context( int dev ) {
 	if ( has_budget ) exts.push_back( VK_EXT_MEMORY_BUDGET_EXTENSION_NAME );
 	if ( g.sg32 ) exts.push_back( VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME );
 	if ( g.cuda ) exts.push_back( VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME );
+	if ( g.coopmat ) exts.push_back( VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME );
 	dci.enabledExtensionCount = static_cast<uint32_t>( exts.size() );
 	dci.ppEnabledExtensionNames = exts.data();
 	if ( sh.adopted ) {
@@ -522,6 +551,12 @@ uint32_t find_memory( uint32_t type_bits, VkMemoryPropertyFlags want ) {
 	return UINT32_MAX;
 }
 
+// Allocations above one storage buffer range are bound to the bound-buffer shaders (push descriptors) through windows of at most kAliasBytes over the same
+// memory: RADV reads a descriptor into a VkBuffer past maxBufferSize wrongly (device addresses and transfers into it are fine). NVIDIA's driver is
+// unaffected and keeps one dedicated buffer (large pages).
+constexpr uint64_t kAliasWindow = uint64_t( 256 ) << 20, kAliasBytes = uint64_t( 3 ) << 30;
+bool needs_alias( size_t bytes ) { return bytes > cur().props.limits.maxStorageBufferRange && cur().props.vendorID != 0x10DE; }
+
 // Buffer + memory; device-local with BDA, or host-visible/coherent and mapped when host is true. False on failure
 bool create_buffer( size_t bytes, bool host, VkBuffer& buf, VkDeviceMemory& mem, void** map ) {
 	VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
@@ -537,7 +572,7 @@ bool create_buffer( size_t bytes, bool host, VkBuffer& buf, VkDeviceMemory& mem,
 	// whose reads stride far apart (a GEMM over long rows), like an address-translation miss per access
 	VkMemoryDedicatedAllocateInfo dedicated{ VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO };
 	dedicated.buffer = buf;
-	VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, &dedicated };
+	VkMemoryAllocateFlagsInfo flags{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO, !host && needs_alias( bytes ) ? nullptr : &dedicated };   // windows over the memory need it shared
 	flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 	VkMemoryAllocateInfo mai{ VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO, host ? nullptr : &flags };
 	mai.allocationSize = req.size;
@@ -1079,6 +1114,7 @@ void* device_malloc_try( size_t bytes ) {
 	if ( !cur().default_stream ) cur().default_stream = make_stream();
 	Alloc a{};
 	a.size = MAX( bytes, size_t( 4 ) );
+	a.aliased = needs_alias( bytes );
 	if ( !create_buffer( bytes, false, a.buffer, a.memory, nullptr ) ) return nullptr;
 	VkBufferDeviceAddressInfo ai{ VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO };
 	ai.buffer = a.buffer;
@@ -1105,6 +1141,11 @@ void device_free( void* p ) {
 		cur().allocs.erase( it );
 	}
 	{ std::lock_guard<std::mutex> qlk( queue_mutex( cur() ) ); vkQueueWaitIdle( cur().queue ); } // cudaFree synchronizes implicitly
+	if ( a.aliased ) {
+		std::lock_guard<std::mutex> lk( cur().mu );
+		const uint64_t addr = reinterpret_cast<uint64_t>( p );
+		for ( auto it = cur().aliases.lower_bound( { addr, 0 } ); it != cur().aliases.end() && it->first.first == addr; it = cur().aliases.erase( it ) ) vkDestroyBuffer( cur().device, it->second, nullptr );
+	}
 	vkDestroyBuffer( cur().device, a.buffer, nullptr );
 	vkFreeMemory( cur().device, a.memory, nullptr );
 }
@@ -1219,6 +1260,7 @@ bool available() {
 const char* device_name() { return ctx().props.deviceName; }
 uint32_t max_push_constants_bytes() { return ctx().props.limits.maxPushConstantsSize; }
 bool int_dot() { return ctx().int_dot; }
+bool coopmat() { return ctx().coopmat; }
 
 // The library build links the kernels in (a generated table): the SPIR-V of a kernel by name, or null (weak: the other builds read the files)
 __attribute__(( weak )) const uint8_t* embedded_spv( const char* name, size_t* bytes );
@@ -1350,8 +1392,29 @@ void dispatch_bound( stream_t st, Pipeline* p, const void* push, const void* con
 		{
 			std::lock_guard<std::mutex> lk( cur().mu );
 			auto it = --cur().allocs.upper_bound( a );
-			left = it->second.size - off;
+			const Alloc& al = it->second;
+			left = al.size - off;
+			if ( al.aliased ) {
+				// a window of the allocation's memory from the 256 MiB boundary below the pointer, at most kAliasBytes long
+				const uint64_t base = off & ~( kAliasWindow - 1 );
+				const uint64_t len = std::min<uint64_t>( al.size - base, kAliasBytes );
+				const auto key = std::make_pair( it->first, base );
+				auto wit = cur().aliases.find( key );
+				if ( wit == cur().aliases.end() ) {
+					VkBufferCreateInfo bci{ VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+					bci.size = len;
+					bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+					VkBuffer wb = VK_NULL_HANDLE;
+					ENGINE_ASSERT( vkCreateBuffer( cur().device, &bci, nullptr, &wb ) == VK_SUCCESS && vkBindBufferMemory( cur().device, wb, al.memory, base ) == VK_SUCCESS,
+						"Vulkan backend: a window over a large allocation could not be created" );
+					wit = cur().aliases.emplace( key, wb ).first;
+				}
+				buf = wit->second;
+				left = len - ( off - base );
+				off -= base;
+			}
 		}
+		ENGINE_ASSERT( off % cur().props.limits.minStorageBufferOffsetAlignment == 0, "Vulkan backend: a bound buffer is misaligned" );
 		info[i] = { buf, off, std::min<VkDeviceSize>( left, cur().props.limits.maxStorageBufferRange ) };
 		writes[i] = { VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET };
 		writes[i].dstBinding = i;
