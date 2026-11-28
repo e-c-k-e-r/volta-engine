@@ -275,6 +275,7 @@ int main( int argc, char** argv ) {
 			std::snprintf( nm, sizeof( nm ), "nvfp4%s_%s_m%d", softmax ? "_sm" : "", shard ? "shard" : "full", m );
 			cases.push_back( { nm, download_half( out.data, out.numel() ) } );
 		}
+#ifndef USE_ROCM   // the extended trellis (tile starts / gains) runs on the CUDA coop kernels only (docs/ROCM.md): no ROCm golden for it
 		for ( int vt = 0; vt < 2; ++vt ) {
 			for ( int shard = 0; shard < 2; ++shard ) {
 				int os[2] = { m, H };
@@ -285,6 +286,7 @@ int main( int argc, char** argv ) {
 				cases.push_back( { nm, download_half( out.data, out.numel() ) } );
 			}
 		}
+#endif
 	}
 
 	{ // accumulate (accum += w * expert_out) and combine (shared + sum_k w[k] * part[k])
